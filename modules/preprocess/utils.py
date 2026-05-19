@@ -63,6 +63,27 @@ def open_safetensors(path, framework: str = "pt", device: str = "cpu"):
     from safetensors import safe_open
     return safe_open(str(path), framework=framework, device=device)
 
+
+def load_safetensors(path, device: str = "cpu") -> dict:
+    """
+    Load a .safetensors file and return a {str: torch.Tensor} dict.
+
+    Symmetric counterpart of save_safetensors. Preferred over torch.load
+    for weight files because it is zero-copy, pickle-free and supports
+    memory-mapped lazy loading.
+
+    Args:
+        path:   path to a .safetensors file produced by save_safetensors.
+        device: target device for the loaded tensors (default "cpu").
+                Pass "cuda:0" to load directly on GPU.
+
+    Returns:
+        dict mapping parameter name → torch.Tensor.
+    """
+    from safetensors.torch import load_file
+    return load_file(str(path), device=device)
+
+
 # torch.save / torch.load helpers (legacy — backward compat with .pt files)
 def save_chunk_safe(chunk: dict, path) -> None:
     """Save a tensor dict to disk with an explicit fsync. Legacy .pt format."""

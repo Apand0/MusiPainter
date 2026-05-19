@@ -156,9 +156,22 @@ def _unwrap_compiled(module):
 
 
 def save_progress(module, save_path):
-    """Save module state_dict to the given path."""
-    logger.info(f"Saving to {save_path}")
-    torch.save(_unwrap_compiled(module).state_dict(), save_path)
+    """
+    Save a module state_dict to disk.
+
+    If *save_path* ends with '.safetensors', the file is written with the
+    safetensors library (zero-copy, pickle-free). Otherwise falls back to
+    torch.save for legacy .bin/.pt paths.
+    """
+    logger.info(f"Saving weights to {save_path}")
+    state = _unwrap_compiled(module).state_dict()
+    if str(save_path).endswith('.safetensors'):
+        # Preferred format: no pickle, safe for distribution.
+        from utils import save_safetensors
+        save_safetensors(state, save_path)
+    else:
+        # Legacy path — backward compat with existing .bin checkpoints.
+        torch.save(state, save_path)
 
 
 def save_checkpoint(embedder, optimizer, scaler, lr_scheduler, global_step, 
@@ -216,26 +229,54 @@ def load_checkpoint(resume_path, embedder, optimizer, scaler, lr_scheduler,
     return global_step, best_vloss, best_model_path
 
 
-def load_embedder_weights(bin_path, embedder, device, resume_step: int = 0):
+def load_embedder_weights(weight_path, embedder, device, resume_step: int = 0):
     """
-    [RESUME-BIN] Carica solo i pesi dell'embedder da un file .bin.
-    Invariato rispetto alla v7.
+    [RESUME-WEIGHTS] Load only the embedder weights from a file.
+
+    Accepts both .safetensors (preferred) and legacy .bin/.pt formats.
+    If *weight_path* points to a .bin that does not exist on disk, the
+    function automatically tries the corresponding .safetensors path before
+    raising FileNotFoundError, ensuring forward compatibility after the
+    format migration.
+
+    Args:
+        weight_path: path to a .safetensors or .bin weight file.
+        embedder:    the FGAEmbedder module (possibly wrapped in DDP/compile).
+        device:      map_location device string (e.g. "cuda:0").
+        resume_step: step counter to resume from (returned unchanged).
     """
-    if not os.path.exists(bin_path):
+    # --- Automatic .bin → .safetensors fallback ---
+    # After the format migration, callers that still pass a .bin path will
+    # transparently pick up the new .safetensors file if it exists.
+    resolved = weight_path
+    if not os.path.exists(resolved) and resolved.endswith(".bin"):
+        sf_candidate = resolved[:-4] + ".safetensors"
+        if os.path.exists(sf_candidate):
+            logger.info(
+                f"[RESUME-WEIGHTS] .bin not found, using .safetensors: {sf_candidate}"
+            )
+            resolved = sf_candidate
+
+    if not os.path.exists(resolved):
         raise FileNotFoundError(
-            f"[RESUME-BIN] File .bin non trovato: {bin_path}"
+            f"[RESUME-WEIGHTS] Weight file not found: {resolved}"
         )
 
-    logger.info(f"[RESUME-BIN] Loading embedder weights from: {bin_path}")
-    state_dict = torch.load(bin_path, map_location=device, weights_only=True)
+    logger.info(f"[RESUME-WEIGHTS] Loading embedder weights from: {resolved}")
+
+    if resolved.endswith(".safetensors"):
+        from utils import load_safetensors
+        state_dict = load_safetensors(resolved, device=str(device))
+    else:
+        state_dict = torch.load(resolved, map_location=device, weights_only=True)
 
     missing, unexpected = _unwrap_compiled(embedder).load_state_dict(state_dict, strict=True)
     if missing:
-        logger.warning(f"[RESUME-BIN] Missing keys: {missing}")
+        logger.warning(f"[RESUME-WEIGHTS] Missing keys: {missing}")
     if unexpected:
-        logger.warning(f"[RESUME-BIN] Unexpected keys: {unexpected}")
+        logger.warning(f"[RESUME-WEIGHTS] Unexpected keys: {unexpected}")
 
-    logger.info(f"[RESUME-BIN] Embedder caricato da: {bin_path} (resume_step={resume_step})")
+    logger.info(f"[RESUME-WEIGHTS] Embedder loaded from: {resolved} (resume_step={resume_step})")
     return resume_step, float('inf')
 
 
@@ -1090,13 +1131,13 @@ def train_validation():
                     save_progress(
                         base_model.embedder,
                         os.path.join(args.output_dir,
-                                     f"weights/{args.run_name}_embeds-step{global_step}.bin")
+                                     f"weights/{args.run_name}_embeds-step{global_step}.safetensors")
                     )
                     if args.lora:
                         save_progress(
                             base_model.lora_layers,
                             os.path.join(args.output_dir,
-                                         f"weights/{args.run_name}_lora-step{global_step}.bin")
+                                         f"weights/{args.run_name}_lora-step{global_step}.safetensors")
                         )
                     save_checkpoint(
                         embedder=base_model.embedder,
@@ -1178,9 +1219,11 @@ def train_validation():
                     print(f'[MID-EPOCH step={global_step}]  train={_avg_train_mid:.4f}  valid={_avg_valid_mid:.4f}')
                     if _avg_valid_mid < best_vloss:
                         best_vloss = _avg_valid_mid
-                        _new_best = os.path.join(args.output_dir, f'best_model_embedder_{timestamp}.bin')
+                        _new_best = os.path.join(args.output_dir, f'best_model_embedder_{timestamp}.safetensors')
                         _new_best_tmp = _new_best + ".tmp"
-                        torch.save(_unwrap_compiled(base_model.embedder).state_dict(), _new_best_tmp)
+                        # Save best embedder in safetensors format (pickle-free).
+                        from utils import save_safetensors as _sf_save
+                        _sf_save(_unwrap_compiled(base_model.embedder).state_dict(), _new_best_tmp)
                         if best_model_path is not None and os.path.exists(best_model_path) and best_model_path != _new_best:
                             os.remove(best_model_path)
                             logger.info(f"[MEM-2] Removed old best: {best_model_path}")
@@ -1190,7 +1233,8 @@ def train_validation():
                                 'best_model_embedder_', 'best_model_lora_'
                             )
                             _new_best_lora_tmp = _new_best_lora + ".tmp"
-                            torch.save(base_model.lora_layers.state_dict(), _new_best_lora_tmp)
+                            # LoRA best weights also saved in safetensors format.
+                            _sf_save(base_model.lora_layers.state_dict(), _new_best_lora_tmp)
                             os.replace(_new_best_lora_tmp, _new_best_lora)
                             logger.info(f"New best LoRA (mid-epoch): {_new_best_lora}")
                         best_model_path = _new_best
@@ -1295,10 +1339,12 @@ def train_validation():
                 if avg_valid < best_vloss:
                     best_vloss = avg_valid
                     new_best_path = os.path.join(
-                        args.output_dir, f'best_model_embedder_{timestamp}.bin'
+                        args.output_dir, f'best_model_embedder_{timestamp}.safetensors'
                     )
                     new_best_path_tmp = new_best_path + ".tmp"
-                    torch.save(_unwrap_compiled(base_model.embedder).state_dict(), new_best_path_tmp)
+                    # Save best embedder weights in safetensors format (pickle-free).
+                    from utils import save_safetensors as _sf_save_ep
+                    _sf_save_ep(_unwrap_compiled(base_model.embedder).state_dict(), new_best_path_tmp)
                     if best_model_path is not None and os.path.exists(best_model_path) and best_model_path != new_best_path:
                         os.remove(best_model_path)
                         logger.info(f"[MEM-2] Removed old best: {best_model_path}")
@@ -1308,7 +1354,8 @@ def train_validation():
                             'best_model_embedder_', 'best_model_lora_'
                         )
                         _best_lora_tmp = _best_lora_path + ".tmp"
-                        torch.save(base_model.lora_layers.state_dict(), _best_lora_tmp)
+                        # LoRA best weights also saved in safetensors format.
+                        _sf_save_ep(base_model.lora_layers.state_dict(), _best_lora_tmp)
                         os.replace(_best_lora_tmp, _best_lora_path)
                         logger.info(f"  ✓ New best LoRA: {_best_lora_path}")
                     best_model_path = new_best_path
@@ -1339,10 +1386,10 @@ def train_validation():
     #  SALVATAGGIO FINALE (solo rank 0)
     if is_main:
         save_progress(base_model.embedder,
-                      os.path.join(args.output_dir, "learned_embeds.bin"))
+                      os.path.join(args.output_dir, "learned_embeds.safetensors"))
         if args.lora:
             save_progress(base_model.lora_layers,
-                          os.path.join(args.output_dir, "learned_embeds_lora_layers.bin"))
+                          os.path.join(args.output_dir, "learned_embeds_lora_layers.safetensors"))
 
         _total_elapsed = time.time() - _t_start
         _h = int(_total_elapsed // 3600)

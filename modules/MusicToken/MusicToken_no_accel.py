@@ -26,6 +26,46 @@ from modules.clip_text_model.modeling_clip import CLIPTextModel
 logger = logging.getLogger(__name__)
 
 
+def _load_weights(path, map_device) -> dict:
+    """
+    Load model weights from a .safetensors or legacy .bin/.pt file.
+
+    Resolution order:
+      1. If *path* ends with '.safetensors' → use load_safetensors (pickle-free).
+      2. Otherwise → torch.load (legacy .bin or .pt checkpoint).
+    If the exact path does not exist and a .bin was requested, the function
+    tries the corresponding .safetensors path before raising FileNotFoundError.
+
+    Args:
+        path:       path string to the weight file.
+        map_device: torch.device used as map_location.
+
+    Returns:
+        dict mapping parameter name → torch.Tensor.
+    """
+    import os
+    resolved = str(path)
+
+    # Transparent fallback: if a .bin is requested but only .safetensors exists.
+    if not os.path.exists(resolved) and resolved.endswith(".bin"):
+        sf_candidate = resolved[:-4] + ".safetensors"
+        if os.path.exists(sf_candidate):
+            logger.info(
+                f"[_load_weights] .bin not found, auto-switching to: {sf_candidate}"
+            )
+            resolved = sf_candidate
+
+    if not os.path.exists(resolved):
+        raise FileNotFoundError(f"[_load_weights] Weight file not found: {resolved}")
+
+    if resolved.endswith(".safetensors"):
+        from modules.preprocess.utils import load_safetensors
+        return load_safetensors(resolved, device=str(map_device))
+
+    # Legacy torch.load path.
+    return torch.load(resolved, map_location=map_device)
+
+
 class MusicTokenWrapper(nn.Module):
     """
     Wraps VAE, UNet, CLIP text encoder, BEATs audio encoder and FGAEmbedder
@@ -184,23 +224,27 @@ class MusicTokenWrapper(nn.Module):
         elif args.data_set == 'test':
             map_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             self.embedder.eval()
-            _state = torch.load(args.learned_embeds, map_location=map_device)
+            # Load via _load_weights to support both .safetensors and legacy .bin.
+            _state = _load_weights(args.learned_embeds, map_device)
             # Strip _orig_mod. prefix produced by torch.compile checkpoints.
             if any(k.startswith("_orig_mod.") for k in _state.keys()):
                 _state = {k[10:]: v for k, v in _state.items()}
             self.embedder.load_state_dict(_state)
             if hasattr(args, 'vae') and args.vae:
+                # Load VAE weights (safetensors or legacy .bin).
                 self.vae.load_state_dict(
-                    torch.load(args.learned_vae, map_location=map_device)
+                    _load_weights(args.learned_vae, map_device)
                 )
             if hasattr(args, 'aud_encoder') and args.aud_encoder \
                and self.aud_encoder is not None:
+                # Load audio encoder weights (safetensors or legacy .bin).
                 self.aud_encoder.load_state_dict(
-                    torch.load(args.learned_aud_encoder, map_location=map_device)
+                    _load_weights(args.learned_aud_encoder, map_device)
                 )
             if hasattr(args, 'unet') and args.unet:
+                # Load UNet weights (safetensors or legacy .bin).
                 self.unet.load_state_dict(
-                    torch.load(args.learned_unet, map_location=map_device)
+                    _load_weights(args.learned_unet, map_device)
                 )
             if hasattr(args, 'lora') and args.lora:
                 # AttnProcsLayers is a direct view of the UNet processor weights;
@@ -210,9 +254,8 @@ class MusicTokenWrapper(nn.Module):
                         "[LORA-TEST] lora_layers is None but --lora=True. "
                         "This should not happen: contact the developer."
                     )
-                _lora_state = torch.load(
-                    args.learned_embeds_lora, map_location=map_device, weights_only=True
-                )
+                # Load LoRA weights (safetensors or legacy .bin).
+                _lora_state = _load_weights(args.learned_embeds_lora, map_device)
                 self.lora_layers.load_state_dict(_lora_state)
                 self.lora_layers.eval()
                 logger.info(

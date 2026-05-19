@@ -43,7 +43,7 @@ def parse_args():
         raise argparse.ArgumentTypeError(f"Valore booleano atteso, ricevuto: '{v}'")
     parser = argparse.ArgumentParser(description="Testing script con pre-encoded embeddings")
     parser.add_argument("--learned_embeds", type=str, 
-                        default='./output/learned_embeds.bin')
+                        default='./output/learned_embeds.safetensors')
     parser.add_argument("--learned_vae", type=str, 
                         default='./output/vae_learned_embeds.bin')
     parser.add_argument("--learned_aud_encoder", type=str, 
@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument("--learned_unet", type=str,
                         default='./output/unet_learned_embeds.bin')
     parser.add_argument("--learned_embeds_lora", type=str,
-                        default='./output/learned_embeds_lora_layers.bin')
+                        default='./output/learned_embeds_lora_layers.safetensors')
     parser.add_argument("--pretrained_model_name_or_path", type=str,
                         default='stabilityai/stable-diffusion-2')
     parser.add_argument("--revision", type=str, default=None, required=False)
@@ -102,6 +102,66 @@ def parse_args():
     return args
 
 
+def _resolve_checkpoint_path(explicit_path: str, output_dir: str,
+                               stem: str, label: str) -> str:
+    """
+    Resolve the best available checkpoint path for a given weight file.
+
+    Search order:
+      1. The explicit path as provided by the user.
+      2. The .safetensors counterpart if a .bin path was given (format migration).
+      3. <output_dir>/<stem>.safetensors
+      4. <output_dir>/<stem>.bin
+      5. Most recent best_model_<label>_*.safetensors in output_dir.
+      6. Most recent best_model_<label>_*.bin in output_dir.
+      7. Most recent weights/<run_name>_<label>-step*.safetensors in output_dir.
+      8. Most recent weights/<run_name>_<label>-step*.bin in output_dir.
+
+    Args:
+        explicit_path: value of --learned_embeds / --learned_embeds_lora.
+        output_dir:    value of --output_dir (parent of weights/).
+        stem:          base filename without extension (e.g. "learned_embeds").
+        label:         used in glob patterns ("embedder" or "lora").
+
+    Returns:
+        Absolute path to the first candidate that exists on disk.
+
+    Raises:
+        FileNotFoundError if none of the candidates is found.
+    """
+    import glob
+
+    candidates = [
+        explicit_path,
+        # Transparent .bin → .safetensors upgrade for callers using old paths.
+        explicit_path.replace(".bin", ".safetensors") if explicit_path.endswith(".bin") else None,
+        os.path.join(output_dir, f"{stem}.safetensors"),
+        os.path.join(output_dir, f"{stem}.bin"),
+    ]
+
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+
+    # Dynamic glob fallback: most-recently-modified best_model or step file.
+    glob_patterns = [
+        os.path.join(output_dir, f"best_model_{label}_*.safetensors"),
+        os.path.join(output_dir, f"best_model_{label}_*.bin"),
+        os.path.join(output_dir, "weights", f"*_{label}-step*.safetensors"),
+        os.path.join(output_dir, "weights", f"*_{label}-step*.bin"),
+    ]
+    for pat in glob_patterns:
+        hits = sorted(glob.glob(pat), key=os.path.getmtime, reverse=True)
+        if hits:
+            return hits[0]
+
+    raise FileNotFoundError(
+        f"[AUTO-CHECKPOINT] No checkpoint found for '{label}'. "
+        f"Searched: {explicit_path} and glob patterns in {output_dir}. "
+        "Train first or pass the correct --learned_embeds path."
+    )
+
+
 def inference(args):
     """Run inference loop and save generated images."""
 
@@ -150,14 +210,29 @@ def inference(args):
     logger.info(f"lora                : {args.lora}")
     if args.lora:
         logger.info(f"learned_embeds_lora : {args.learned_embeds_lora}")
-        if not os.path.exists(args.learned_embeds_lora):
-            raise FileNotFoundError(
-                f"[LORA-TEST] File LoRA non trovato: {args.learned_embeds_lora}\n"
-                "Assicurati di aver eseguito il training con --lora=True e che\n"
-                "il file 'learned_embeds_lora_layers.bin' sia nell'output_dir."
-            )
+        # Existence is verified later by _resolve_checkpoint_path (supports both .safetensors and .bin).
     logger.info(f"  seed                : {args.seed}")
     logger.info("=" * 60)
+
+    # --- Auto-resolve checkpoint paths (handles .bin → .safetensors migration) ---
+    # This runs before MusicTokenWrapper is instantiated so args already contains
+    # the validated, existing path when __init__ calls _load_weights.
+    args.learned_embeds = _resolve_checkpoint_path(
+        explicit_path=args.learned_embeds,
+        output_dir=args.output_dir,
+        stem="learned_embeds",
+        label="embedder",
+    )
+    logger.info(f"[AUTO-CHECKPOINT] Resolved embedder weights: {args.learned_embeds}")
+
+    if args.lora:
+        args.learned_embeds_lora = _resolve_checkpoint_path(
+            explicit_path=args.learned_embeds_lora,
+            output_dir=args.output_dir,
+            stem="learned_embeds_lora_layers",
+            label="lora",
+        )
+        logger.info(f"[AUTO-CHECKPOINT] Resolved LoRA weights: {args.learned_embeds_lora}")
 
     if args.tokenizer_name:
         tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name)

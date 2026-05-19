@@ -615,3 +615,64 @@ extracted from the source files.
   rhythmic structure, and layer 12 carries high-level semantics. The fix
   concatenates the three layers into a 2304-D vector, preserving the full
   representational richness required by the Musipainter paper.
+
+
+# =============================================================================
+# safetensors weight format migration  (2026-05-19)
+# =============================================================================
+
+[FMT-SAFETENSORS] WEIGHT FILES MIGRATED TO SAFETENSORS FORMAT
+
+  Scope: weight output files only (embedder, LoRA, best-model snapshots).
+  The training resume checkpoint (checkpoint_step{N}.pt) is NOT changed —
+  it contains optimizer/scaler/scheduler state that requires torch.save.
+
+  Why:
+    torch.save uses Python pickle. Pickle files can execute arbitrary code
+    on load and are rejected by some security scanners. safetensors stores
+    only flat {str → tensor} dicts; it is pickle-free, zero-copy (mmap),
+    and validated against out-of-bounds reads at open time.
+
+  Files changed:
+    utils.py
+      - Added load_safetensors(path, device) → dict[str, Tensor].
+        Symmetric counterpart of the existing save_safetensors helper.
+
+    train_validation_no_accel_colab.py
+      - save_progress(module, save_path): now dispatches on extension —
+        .safetensors → save_safetensors; anything else → torch.save (legacy).
+      - load_embedder_weights(weight_path, ...): transparent .bin → .safetensors
+        fallback; accepts both formats; renamed parameter bin_path → weight_path.
+      - All weight output paths renamed .bin → .safetensors:
+          learned_embeds.safetensors
+          learned_embeds_lora_layers.safetensors
+          weights/{run_name}_embeds-step{N}.safetensors
+          weights/{run_name}_lora-step{N}.safetensors
+          best_model_embedder_{timestamp}.safetensors
+          best_model_lora_{timestamp}.safetensors
+      - Best-model save blocks (mid-epoch and end-of-epoch) now call
+        save_safetensors directly instead of torch.save; atomic rename (.tmp)
+        preserved.
+
+    MusicToken_no_accel.py
+      - Added module-level helper _load_weights(path, map_device) → dict.
+        Chooses the loader based on file extension; falls back transparently
+        from .bin to .safetensors if only the new format exists on disk.
+      - All torch.load calls in the test branch replaced with _load_weights:
+        embedder, VAE, BEATs audio encoder, UNet, LoRA layers.
+
+    test_no_accel_colab.py
+      - Added _resolve_checkpoint_path(explicit_path, output_dir, stem, label).
+        Search order: explicit path → .safetensors sibling → output_dir/<stem>.*
+        → most-recent best_model_<label>_* → most-recent weights/*-step*.
+        Raises FileNotFoundError with a clear message if nothing is found.
+      - inference() calls _resolve_checkpoint_path for embedder (always) and
+        LoRA (when --lora=True) before instantiating MusicTokenWrapper, so
+        args.learned_embeds always points to a verified, existing file.
+      - Default --learned_embeds and --learned_embeds_lora updated to .safetensors.
+      - Redundant os.path.exists guard for LoRA replaced by the resolver.
+
+  Backward compatibility:
+    Old .bin files produced by previous training runs are still readable.
+    Every load path tries .bin first if that is what was passed, then falls
+    back to .safetensors. The resume checkpoint (.pt) is fully unaffected.
