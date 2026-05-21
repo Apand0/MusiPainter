@@ -107,7 +107,7 @@ def temporal_pool(features: torch.Tensor, stride: int) -> torch.Tensor:
     if stride <= 1:
         return features
     T = features.shape[0]
-    feat_dim = features.shape[-1]  # [FIX-2304] dinamico: 768 o 2304
+    feat_dim = features.shape[-1]  # dinamico: 768 o 2304
     T_new = T // stride
     return features[:T_new * stride].view(T_new, stride, feat_dim).mean(dim=1)
 
@@ -120,7 +120,7 @@ def extract_features_batch(aud_encoder: torch.nn.Module, audio_paths: list[str],
     """
     [SPEED-3] Carica gli audio in parallelo con ThreadPoolExecutor,
     poi fa l'inference BEATs in un unico batch GPU.
-    Returns: ({audio_id: tensor [T, 2304]}, [errors])  # [FIX-2304] era T,768
+    Returns: ({audio_id: tensor [T, 2304]}, [errors])  # era T,768
     """
     results: dict[str, torch.Tensor] = {}
     errors:  list[str]               = []
@@ -201,15 +201,15 @@ def _chunk_dir(output_dir: Path) -> Path:
 
 
 def _chunk_path(chunks_dir: Path, idx: int) -> Path:
-    return chunkss_dir / f"chunk_{idx:04d}.safetensors"
+    return chunks_dir / f"chunk_{idx:04d}.safetensors"
 
 
 def _existing_ids_from_chunks(chunks_dir: Path) -> set[str]:
     """
-    [MEM-3] Legge SOLO le chiavi (header) dei chunks senza caricare tensori.
+    Legge SOLO le chiavi (header) dei chunks senza caricare tensori.
     """
     existing: set[str] = set()
-    if not chunkss_dir.exists():
+    if not chunks_dir.exists():
         return existing
     for sf_path in sorted(chunks_dir.glob("chunk_*.safetensors")):
         try:
@@ -227,7 +227,7 @@ def _next_chunk_idx(chunks_dir: Path) -> int:
     return int(existing[-1].stem.split("_")[1]) + 1
 
 
-def _flush_chunk(embeddings: dict[str, torch.Tensor], chunkss_dir: Path, chunks_idx: int,
+def _flush_chunk(embeddings: dict[str, torch.Tensor], chunks_dir: Path, chunks_idx: int,
     ) -> None:
     path = _chunk_path(chunks_dir, chunks_idx)
     save_safetensors(embeddings, path)
@@ -238,12 +238,12 @@ def _flush_chunk(embeddings: dict[str, torch.Tensor], chunkss_dir: Path, chunks_
     )
 
 
-def _merge_chunks(chunkss_dir: Path, output_sf: Path, t_frames_pooled: int, sample_rate: int,
+def _merge_chunks(chunks_dir: Path, output_sf: Path, t_frames_pooled: int, sample_rate: int,
                 temporal_pool_stride: int, beats_checkpoint: str, device: str,
                 duration_seconds: int, batch_size: int, n_errors: int,
     ) -> bool:
     """
-    [MEM-4] Merge streaming: scrive il file safetensors finale un chunks alla
+    Merge streaming: scrive il file safetensors finale un chunks alla
     volta eliminando ogni chunks sorgente subito dopo la scrittura.
 
     PROBLEMA DEL MERGE CLASSICO:
@@ -286,15 +286,15 @@ def _merge_chunks(chunkss_dir: Path, output_sf: Path, t_frames_pooled: int, samp
 
     if free_bytes < min_needed:
         logger.warning(
-            f"[MEM-4] Insufficient space even for streaming merge: "
+            f"Insufficient space even for streaming merge: "
             f"need at least ~{largest_mb:.0f} MB (largest chunks) + 200 MB margin, "
             f"available ~{free_mb:.0f} MB. "
-            f"I chunks rimangono in chunkss/ — il dataloader li leggerà direttamente."
+            f"I chunks rimangono in chunks/ — il dataloader li leggerà direttamente."
         )
         return False
 
     logger.info(
-        f"[MEM-4] STREAMING merge of {len(chunk_files)} chunkss ({total_mb:.0f} MB totali) "
+        f"STREAMING merge of {len(chunk_files)} chunks ({total_mb:.0f} MB totali) "
         f"→ {output_sf.name}  (max extra space: ~{largest_mb:.0f} MB)"
     )
 
@@ -352,7 +352,7 @@ def _merge_chunks(chunkss_dir: Path, output_sf: Path, t_frames_pooled: int, samp
         "batch_size_used":      str(batch_size),
         "beats_model":          Path(beats_checkpoint).stem,
         "device_used":          device,
-        "feature_dim":          "2304",  # [FIX-2304] concatenazione layer 4+8+12
+        "feature_dim":          "2304",  # concatenazione layer 4+8+12
         "dtype":                "float16",
         "errors":               str(n_errors),
     }
@@ -363,12 +363,12 @@ def _merge_chunks(chunkss_dir: Path, output_sf: Path, t_frames_pooled: int, samp
 
     size_mb = output_sf.stat().st_size / (1024 ** 2)
     logger.info(
-        f"  ✓ Merge completed: {output_sf.name}  ({size_mb:.1f} MB, {n_total} audio)"
+        f"  Merge completed: {output_sf.name}  ({size_mb:.1f} MB, {n_total} audio)"
     )
-    # Rimuovi la cartella chunkss se vuota
+    # Rimuovi la cartella chunks se vuota
     try:
-        chunkss_dir.rmdir()
-        logger.info(f"  Cartella chunkss/ rimossa.")
+        chunks_dir.rmdir()
+        logger.info(f"  Cartella chunks/ rimossa.")
     except OSError:
         pass  # non vuota, lascia stare
     return True
@@ -383,7 +383,7 @@ def preprocess_audio_dataset(audio_dir: str, output_dir: str = "./audio_embeddin
 
     t_frames_raw    = (sample_rate * duration_seconds) // 160
     t_frames_pooled = t_frames_raw // temporal_pool_stride if temporal_pool_stride > 1 else t_frames_raw
-    mb_per_audio    = t_frames_pooled * 2304 * 2 / (1024 ** 2)  # [FIX-2304] era 768
+    mb_per_audio    = t_frames_pooled * 2304 * 2 / (1024 ** 2)  # era 768
     max_ram_mb      = FLUSH_EVERY_N_BATCHES * batch_size * mb_per_audio
 
     _t_start = time.time()
@@ -415,7 +415,7 @@ def preprocess_audio_dataset(audio_dir: str, output_dir: str = "./audio_embeddin
 
     os.makedirs(output_dir, exist_ok=True)
     output_dir_p = Path(output_dir)
-    chunkss_dir   = _chunk_dir(output_dir_p)
+    chunks_dir   = _chunk_dir(output_dir_p)
     output_sf    = output_dir_p / "audio_embeddings.safetensors"
 
     already_done = _existing_ids_from_chunks(chunks_dir)
@@ -447,7 +447,7 @@ def preprocess_audio_dataset(audio_dir: str, output_dir: str = "./audio_embeddin
     if not audio_to_process:
         logger.info("All audio already present. Proceeding to final merge if needed.")
         _merge_chunks(
-            chunkss_dir, output_sf,
+            chunks_dir, output_sf,
             t_frames_pooled, sample_rate, temporal_pool_stride,
             beats_checkpoint, device, duration_seconds, batch_size, 0,
         )
@@ -480,7 +480,7 @@ def preprocess_audio_dataset(audio_dir: str, output_dir: str = "./audio_embeddin
         is_last = batch_num == len(batches) - 1
         if (batch_num + 1) % FLUSH_EVERY_N_BATCHES == 0 or is_last:
             if new_embeddings:
-                _flush_chunk(new_embeddings, chunkss_dir, chunks_idx)
+                _flush_chunk(new_embeddings, chunks_dir, chunks_idx)
                 chunks_idx += 1
                 new_embeddings = {}
                 gc.collect()
@@ -492,7 +492,7 @@ def preprocess_audio_dataset(audio_dir: str, output_dir: str = "./audio_embeddin
     )
 
     merged = _merge_chunks(
-        chunkss_dir, output_sf,
+        chunks_dir, output_sf,
         t_frames_pooled, sample_rate, temporal_pool_stride,
         beats_checkpoint, device, duration_seconds, batch_size,
         len(all_errors),
@@ -513,7 +513,7 @@ def preprocess_audio_dataset(audio_dir: str, output_dir: str = "./audio_embeddin
         "audio_ids":            all_ids,
         "output_file":          "audio_embeddings.safetensors" if merged else "chunks/",
         "chunks_dir":           str(chunks_dir) if not merged else None,
-        "embedding_shape":      [t_frames_pooled, 2304],  # [FIX-2304] era 768
+        "embedding_shape":      [t_frames_pooled, 2304],  # era 768
         "sample_rate":          sample_rate,
         "duration_seconds":     duration_seconds,
         "batch_size_used":      batch_size,
@@ -544,7 +544,7 @@ def preprocess_audio_dataset(audio_dir: str, output_dir: str = "./audio_embeddin
     logger.info(f"new this run        : {n_new_total}")
     logger.info(f"errors              : {len(all_errors)}")
     logger.info(f"audio/second        : {n_new_total / max(_elapsed, 1):.2f}")
-    logger.info(f"final merge         : {'✓' if merged else '✗ (chunk in chunkss/)'}")
+    logger.info(f"final merge         : {'' if merged else '(chunk in chunks/)'}")
     logger.info(f"output_dir          : {output_dir}")
     logger.info("=" * 60)
 
