@@ -113,7 +113,7 @@ def load_vae(pretrained_model_name_or_path: str, device: str) -> nn.Module:
 
     if n_gpus > 1:
         logger.info(
-            f"[OPT-1] {n_gpus} GPU — DataParallel VAE: "
+            f"{n_gpus} GPU — DataParallel VAE: "
             + ", ".join(torch.cuda.get_device_name(i) for i in range(n_gpus))
         )
         return nn.DataParallel(wrapper)
@@ -138,7 +138,7 @@ def _chunk_path(chunks_dir: Path, idx: int) -> Path:
 
 def _existing_ids_from_chunks(chunks_dir: Path) -> set[str]:
     """
-    [MEM-3] Legge SOLO le chiavi (header) dei chunks senza caricare tensori.
+    Legge SOLO le chiavi (header) dei chunks senza caricare tensori.
     """
     existing: set[str] = set()
     if not chunkss_dir.exists():
@@ -174,7 +174,7 @@ def _merge_chunks( chunkss_dir: Path, output_sf: Path, resolution: int, center_c
                 pretrained_model_name_or_path: str, device: str, n_errors: int,
     ) -> bool:
     """
-    [MEM-4] Merge STREAMING: elimina ogni chunks sorgente subito dopo averlo
+    Merge STREAMING: elimina ogni chunks sorgente subito dopo averlo
     letto, recuperando spazio disco progressivamente.
     Lo spazio extra massimo usato = chunks più grande (invece del totale).
     Ritorna True se il merge è riuscito, False se anche il minimo spazio manca.
@@ -193,7 +193,7 @@ def _merge_chunks( chunkss_dir: Path, output_sf: Path, resolution: int, center_c
 
     if free_bytes < min_needed:
         logger.warning(
-            f"[MEM-4] Insufficient space even for streaming merge: "
+            f"Insufficient space even for streaming merge: "
             f"need at least ~{largest_mb:.0f} MB (largest chunks) + 200 MB margin, "
             f"available ~{free_mb:.0f} MB. "
             f"I chunks rimangono in chunkss/ — il dataloader li leggerà direttamente."
@@ -201,7 +201,7 @@ def _merge_chunks( chunkss_dir: Path, output_sf: Path, resolution: int, center_c
         return False
 
     logger.info(
-        f"[MEM-4] STREAMING merge of {len(chunk_files)} chunkss ({total_mb:.0f} MB totali) "
+        f"STREAMING merge of {len(chunk_files)} chunkss ({total_mb:.0f} MB totali) "
         f"→ {output_sf.name}  (max extra space: ~{largest_mb:.0f} MB)"
     )
 
@@ -235,7 +235,7 @@ def _merge_chunks( chunkss_dir: Path, output_sf: Path, resolution: int, center_c
     gc.collect()
 
     size_mb = output_sf.stat().st_size / (1024 ** 2)
-    logger.info(f"  ✓ Merge completed: {output_sf.name}  ({size_mb:.1f} MB)")
+    logger.info(f"  Merge completed: {output_sf.name}  ({size_mb:.1f} MB)")
     try:
         chunkss_dir.rmdir()
         logger.info(f"  Cartella chunkss/ rimossa.")
@@ -478,7 +478,7 @@ def preprocess_image_latents( image_dir: str, output_dir: str, pretrained_model_
     logger.info(f"nuove questo run    : {n_new_total}")
     logger.info(f"errors              : {len(errors)}")
     logger.info(f"throughput          : {n_new_total / max(_total_elapsed, 1e-3):.1f} img/s")
-    logger.info(f"final merge         : {'✓' if merged else '✗ (chunk in chunkss/)'}")
+    logger.info(f"final merge         : {'' if merged else '(chunk in chunkss/)'}")
     logger.info(f"output_dir          : {output_dir}")
     logger.info("=" * 60)
 
