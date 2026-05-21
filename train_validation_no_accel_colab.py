@@ -436,7 +436,7 @@ def parse_args():
     parser.add_argument("--use_precomputed_embeddings", type=_str2bool, default=True)
     parser.add_argument("--validate_every_n_epochs", type=int, default=5)
     parser.add_argument("--validate_every_n_steps", type=int, default=0)
-    parser.add_argument("--precompute_vae_latents", type=_str2bool, default=True)
+    parser.add_argument("--use_precompute_vae_latents", type=_str2bool, default=True)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False)
     parser.add_argument("--max_tb_size_mb", type=int, default=200)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)

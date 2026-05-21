@@ -274,12 +274,12 @@ def inference(args):
             # Determine audio temporal length from a dummy forward
             _T_a = 376  # 30s × 16kHz / 160 / 8 (same as EarlyFusionEncoder default)
             _silent_audio = torch.zeros(
-                1, _T_a, 768 * 3, dtype=torch.float32, device=device
+                1, _T_a, 768 * 3, dtype=weight_dtype, device=device
             )
             _text_tokens = base_model._get_text_embeddings(_uncond_ids)
             _uncond_fused = base_model.early_fusion(
                 audio_tokens=_silent_audio,
-                text_tokens=_text_tokens.float(),
+                text_tokens=_text_tokens.to(weight_dtype),
             )  # [1, output_size]
             uncond_embeddings = _uncond_fused.unsqueeze(1).to(dtype=weight_dtype)
             # [1, 1, output_size]
@@ -314,13 +314,13 @@ def inference(args):
             # ── Conditional embedding (audio + text fused) ────────────────────
             # It internally: projects audio + text → shared Transformer → pool →
             # output_proj → [B, output_size].
-            audio_feats_f32 = aud_features.float()
-            text_tokens_f32 = base_model._get_text_embeddings(cond_input_ids)
-
+            audio_feats = aud_features.to(weight_dtype)
+            text_tokens = base_model._get_text_embeddings(cond_input_ids).to(weight_dtype)
+            
             cond_fused = base_model.early_fusion(
-                audio_tokens=audio_feats_f32,
-                text_tokens=text_tokens_f32,
-            )  # [1, output_size]
+                audio_tokens=audio_feats,
+                text_tokens=text_tokens,
+                )  # [1, output_size]
             cond_embeddings = cond_fused.unsqueeze(1).to(dtype=weight_dtype)
             # [1, 1, output_size]
 
