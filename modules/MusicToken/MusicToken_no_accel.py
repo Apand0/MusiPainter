@@ -17,7 +17,7 @@ from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.models.attention_processor import LoRAAttnProcessor
 
 from modules.BEATs.BEATs import BEATs, BEATsConfig
-from modules.MusicToken.early_fusion_encoder import EarlyFusionEncoder
+from modules.fusion.early_fusion_encoder import EarlyFusionEncoder
 
 logger = logging.getLogger(__name__)
 
