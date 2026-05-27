@@ -1,13 +1,16 @@
 # @title dataloader_colab.py
 """
-dataloader_colab.py — Dataset and lazy-loading indices for the Musipainter pipeline.
+Dataset and lazy-loading indices for the Musipainter pipeline (Early Fusion branch).
 
-Provides:
-  LazyEmbeddingIndex  — lazy or preloaded index for audio embeddings
-                        (.safetensors, chunked .safetensors, or legacy .pt)
-  LazyLatentIndex     — lazy or preloaded index for precomputed VAE latents
-  Museart             — PyTorch Dataset pairing audio files with WikiArt images
-                        by shared thematic class
+LazyEmbeddingIndex accepts a COMMA-SEPARATED STRING of directories so that
+audio embeddings spread across multiple read-only Kaggle Datasets can be
+treated as one unified index by the training loop.
+
+Supported directory layouts (auto-detected, mixed layouts are fine):
+  1. <dir>/audio_embeddings.safetensors   — single merged file
+  2. <dir>/chunks/<class>_chunk_*.safetensors  — per-class chunks
+  3. <dir>/chunks/chunk_*.safetensors          — generic chunks
+  4. <dir>/audio_embeddings_*.pt               — legacy torch.save chunks
 """
 
 import collections
@@ -27,276 +30,298 @@ from modules.preprocess.utils import safe_torch_load as _safe_torch_load, open_s
 
 logger = logging.getLogger(__name__)
 
-# Resolve the correct PIL resampling constants for PIL >= 9.1.
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
-        "linear": PIL.Image.Resampling.BILINEAR,
+        "linear":   PIL.Image.Resampling.BILINEAR,
         "bilinear": PIL.Image.Resampling.BILINEAR,
-        "bicubic": PIL.Image.Resampling.BICUBIC,
-        "lanczos": PIL.Image.Resampling.LANCZOS,
-        "nearest": PIL.Image.Resampling.NEAREST,
+        "bicubic":  PIL.Image.Resampling.BICUBIC,
+        "lanczos":  PIL.Image.Resampling.LANCZOS,
+        "nearest":  PIL.Image.Resampling.NEAREST,
     }
 else:
     PIL_INTERPOLATION = {
-        "linear": PIL.Image.LINEAR,
+        "linear":   PIL.Image.LINEAR,
         "bilinear": PIL.Image.BILINEAR,
-        "bicubic": PIL.Image.BICUBIC,
-        "lanczos": PIL.Image.LANCZOS,
-        "nearest": PIL.Image.NEAREST,
+        "bicubic":  PIL.Image.BICUBIC,
+        "lanczos":  PIL.Image.LANCZOS,
+        "nearest":  PIL.Image.NEAREST,
     }
 
 imagenet_templates_small = ["an art image of {}"]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  LazyEmbeddingIndex  (multi-dataset, multi-layout)
+# ─────────────────────────────────────────────────────────────────────────────
+
 class LazyEmbeddingIndex:
     """
-    Provides access to precomputed BEATs audio embeddings from disk.
+    Unified lazy index over one or more directories of precomputed BEATs audio embeddings.
 
-    Supports three storage formats (auto-detected in priority order):
-      1. audio_embeddings.safetensors      — single safetensors file
-      2. chunks/chunk_*.safetensors        — chunked safetensors (when merge failed)
-      3. audio_embeddings_*.pt             — legacy torch.save chunks
+    The *embeddings_dirs* argument accepts a comma-separated string of directory paths
+    so that embeddings spread across multiple read-only Kaggle Datasets can be used
+    transparently. If the same audio ID appears in more than one directory, the last
+    occurrence wins — a warning is logged at DEBUG level.
 
-    Two access modes (controlled by preload_all):
-      preload_all=True  (default) — entire dataset loaded into RAM at init;
-                                    zero I/O during training. Dict is shared
-                                    across DataLoader workers via fork (copy-on-write).
-      preload_all=False           — lazy mmap via safe_open; each get_tensor()
-                                    reads only that tensor's bytes. Ideal when
-                                    available RAM < ~2 GB.
+    Supported layouts per directory (auto-detected, priority order):
+      1. audio_embeddings.safetensors        — single merged file
+      2. chunks/<class>_chunk_*.safetensors  — per-class chunks (preprocess_manager output)
+      3. chunks/chunk_*.safetensors          — generic chunks
+      4. audio_embeddings_*.pt               — legacy torch.save chunks
 
-    For chunked safetensors with preload_all=False, an LRU cache of file handles
-    (max_sf_handles) avoids re-opening the same chunk file on every access.
+    Access modes (controlled by *preload_all*):
+      True  (default): load all tensors into RAM at init → zero I/O during training.
+      False:           mmap / LRU-cached file handles → O(1) RAM regardless of dataset size.
     """
 
-    def __init__(self, embeddings_dir: str, preload_all: bool = True,
-                 max_sf_handles: int = 4):
-        self.embeddings_dir  = Path(embeddings_dir)
+    def __init__(
+        self,
+        embeddings_dirs: str,
+        preload_all:     bool = True,
+        max_sf_handles:  int  = 8,
+    ):
+        raw_dirs = [d.strip() for d in str(embeddings_dirs).split(",") if d.strip()]
+        self._dirs: list[Path] = [Path(d) for d in raw_dirs]
+
         self._preload_all    = preload_all
-        self._index: dict    = {}   # audio_id → chunk_path (str) or True
-        self._flat_cache: dict = {} # audio_id → tensor  (when preload_all=True)
-        self._sf             = None # SafeOpen handle for single-file mode
-        self._lru_cache: dict          = {}
-        self._lru: collections.deque   = collections.deque()
-        self._max_cached_chunks: int   = 4
-        self._sf_handles: dict         = {}   # chunk_path → SafeOpen handle (chunked mode)
-        self._sf_lru: collections.deque = collections.deque()
-        self._max_sf_handles: int      = max_sf_handles
-        self._mode: str                = "unknown"
+        self._max_sf_handles = max_sf_handles
+
+        self._index:      dict = {}   # audio_id → True (preloaded) or str path (lazy)
+        self._flat_cache: dict = {}   # audio_id → tensor  (preload_all=True)
+        self._sf_handles: dict = {}   # path_str  → SafeOpen handle (lazy mode)
+        self._sf_lru:     collections.deque = collections.deque()
+        self._lru_cache:  dict = {}   # path_str  → loaded .pt chunk dict (legacy lazy)
+        self._lru:        collections.deque = collections.deque()
+        self._max_cached_chunks = 4
+
+        self._total_ids     = 0
+        self._total_size_mb = 0.0
+
+        valid_dirs = [d for d in self._dirs if d.exists()]
+        if not valid_dirs:
+            raise FileNotFoundError(
+                "LazyEmbeddingIndex: none of the following directories exist:\n"
+                + "\n".join(f"  {d}" for d in self._dirs)
+            )
+        missing = set(self._dirs) - set(valid_dirs)
+        if missing:
+            logger.warning(
+                f"LazyEmbeddingIndex: {len(missing)} director(ies) not found and skipped:\n"
+                + "\n".join(f"  {d}" for d in sorted(missing))
+            )
+        self._dirs = valid_dirs
         self._build_index()
 
-    def _build_index(self):
-        sf_file      = self.embeddings_dir / "audio_embeddings.safetensors"
-        chunks_dir   = self.embeddings_dir / "chunks"
-        chunk_files  = sorted(chunks_dir.glob("chunk_*.safetensors")) if chunks_dir.exists() else []
-        legacy_files = sorted(self.embeddings_dir.glob("audio_embeddings_*.pt"))
+    # ──────────────────────────────────────────────────────────────────────────
+    def _build_index(self) -> None:
+        mode_label = "preload RAM" if self._preload_all else "lazy mmap"
+        logger.info(
+            f"LazyEmbeddingIndex [{mode_label}] scanning "
+            f"{len(self._dirs)} director(ies)..."
+        )
 
-        # ── SAFETENSORS (single file) ──────────────────────────────────────
-        if sf_file.exists():
-            self._mode     = "safetensors"
-            total_size_mb  = sf_file.stat().st_size / (1024 ** 2)
-            mode_label     = "preload RAM" if self._preload_all else "lazy mmap"
-            logger.info(
-                f"LazyEmbeddingIndex [safetensors | {mode_label}]: "
-                f"{sf_file.name}  ({total_size_mb:.1f} MB)"
-            )
-            self._sf = open_safetensors(sf_file)
-            keys     = list(self._sf.keys())
-            sample_shape = None
+        sample_shape: list | None = None
+        total_files_scanned = 0
 
-            if self._preload_all:
-                for audio_id in keys:
-                    t = self._sf.get_tensor(audio_id)
-                    t = t.squeeze(0) if t.dim() == 3 else t
-                    self._flat_cache[audio_id] = t
-                    self._index[audio_id]      = True
-                    if sample_shape is None:
-                        sample_shape = list(t.shape)
-                self._sf = None  # handle no longer needed
-            else:
-                for audio_id in keys:
-                    self._index[audio_id] = True
-                if keys:
-                    sample_shape = list(self._sf.get_tensor(keys[0]).shape)
+        for d in self._dirs:
+            n_before   = len(self._index)
+            sf_files   = self._collect_sf_files(d)
 
-            logger.info("=" * 60)
-            logger.info("[AUDIO EMBEDDINGS] safetensors loaded successfully:")
-            logger.info(f"Format        : safetensors")
-            logger.info(f"Mode          : {mode_label}")
-            logger.info(f"Total audio   : {len(self._index)}")
-            logger.info(f"File size     : {total_size_mb:.1f} MB")
-            logger.info(f"Tensor shape  : {sample_shape}  (dtype: float16)")
-            logger.info(f"File          : {sf_file}")
-            if self._preload_all:
-                logger.info(f"In RAM        : {len(self._flat_cache)} embeddings")
-            logger.info("=" * 60)
+            if not sf_files:
+                logger.warning(f"  No safetensors files found in {d} — skipped.")
+                # Still try legacy .pt files
+                self._index_legacy_pt(d, sample_shape)
+                continue
 
-        # ── CHUNKED SAFETENSORS (chunks/chunk_NNNN.safetensors) ───────────
-        elif chunk_files:
-            self._mode = "chunked_safetensors"
-            total_size_bytes = sum(f.stat().st_size for f in chunk_files)
-            total_size_mb    = total_size_bytes / (1024 ** 2)
-            mode_label       = "preload RAM" if self._preload_all else "lazy mmap (LRU handle)"
-            logger.info(
-                f"LazyEmbeddingIndex [chunked_safetensors | {mode_label}]: "
-                f"{len(chunk_files)} chunks in {chunks_dir}  ({total_size_mb:.1f} MB total)"
-            )
-            sample_shape = None
+            total_files_scanned += len(sf_files)
 
-            for chunk_path in chunk_files:
-                sf = open_safetensors(chunk_path)
-                chunk_path_str = str(chunk_path)
-                # Single pass over sf.keys() to avoid scanning the header twice.
-                # preload_all=True  → _index[id] = True   (tensor already in _flat_cache)
-                # preload_all=False → _index[id] = path   (opened on demand via LRU)
-                for audio_id in sf.keys():
-                    if self._preload_all:
-                        t = sf.get_tensor(audio_id)
-                        t = t.squeeze(0) if t.dim() == 3 else t
-                        self._flat_cache[audio_id] = t
-                        self._index[audio_id] = True
-                        if sample_shape is None:
-                            sample_shape = list(t.shape)
-                    else:
-                        self._index[audio_id] = chunk_path_str
-                        if sample_shape is None:
+            for sf_path in sf_files:
+                self._total_size_mb += sf_path.stat().st_size / (1024 ** 2)
+                try:
+                    sf = open_safetensors(sf_path)
+                    chunk_path_str = str(sf_path)
+
+                    for audio_id in sf.keys():
+                        if audio_id in self._index:
+                            logger.debug(
+                                f"  Duplicate audio_id '{audio_id}' — "
+                                f"overwriting with {sf_path.name}"
+                            )
+                        if self._preload_all:
                             t = sf.get_tensor(audio_id)
-                            sample_shape = list(t.shape)
-                # Close the handle; with preload_all=True tensors are already cached;
-                # with preload_all=False handles are re-opened on demand via the LRU cache.
-                del sf
+                            t = t.squeeze(0) if t.dim() == 3 else t
+                            self._flat_cache[audio_id] = t
+                            self._index[audio_id]      = True
+                            if sample_shape is None:
+                                sample_shape = list(t.shape)
+                        else:
+                            self._index[audio_id] = chunk_path_str
+                            if sample_shape is None:
+                                t = sf.get_tensor(audio_id)
+                                sample_shape = list(t.shape)
 
-            logger.info("=" * 60)
-            logger.info("[AUDIO EMBEDDINGS] chunked safetensors loaded:")
-            logger.info(f"Format        : chunked safetensors")
-            logger.info(f"Mode          : {mode_label}")
-            logger.info(f"Chunk files   : {len(chunk_files)}")
-            logger.info(f"Total audio   : {len(self._index)}")
-            logger.info(f"Total size    : {total_size_mb:.1f} MB")
-            logger.info(f"Tensor shape  : {sample_shape}  (dtype: float16)")
-            logger.info(f"Chunks dir    : {chunks_dir}")
-            if self._preload_all:
-                logger.info(f"In RAM        : {len(self._flat_cache)} embeddings")
-            else:
-                logger.info(f"Handle LRU    : max {self._max_sf_handles} open simultaneously")
-            logger.info("=" * 60)
+                    if self._preload_all:
+                        del sf   # handle no longer needed
 
-        # ── LEGACY .pt ─────────────────────────────────────────────────────
-        elif legacy_files:
-            self._mode = "legacy_pt"
-            logger.warning(
-                f"LazyEmbeddingIndex: no audio_embeddings.safetensors found. "
-                f"Using {len(legacy_files)} legacy .pt chunks. "
-                f"Re-run preprocess_audio_embeddings_colab.py to migrate to safetensors."
-            )
-            total_size_bytes = sum(f.stat().st_size for f in legacy_files)
-            total_size_mb    = total_size_bytes / (1024 ** 2)
-            sample_shape     = None
+                except Exception as exc:
+                    logger.warning(f"  Cannot read {sf_path}: {exc} — skipped.")
 
-            for chunk_file in legacy_files:
+            self._index_legacy_pt(d, sample_shape)
+
+            n_added = len(self._index) - n_before
+            logger.info(f"  {d}  →  {n_added} audio IDs")
+
+        self._total_ids = len(self._index)
+
+        logger.info("=" * 60)
+        logger.info("[AUDIO EMBEDDINGS]  index built:")
+        logger.info(f"  Directories      : {len(self._dirs)}")
+        logger.info(f"  Files scanned    : {total_files_scanned}")
+        logger.info(f"  Total audio IDs  : {self._total_ids}")
+        logger.info(f"  Total size       : {self._total_size_mb:.1f} MB")
+        logger.info(f"  Sample shape     : {sample_shape}  (float16)")
+        logger.info(f"  Mode             : {mode_label}")
+        if self._preload_all:
+            logger.info(f"  In RAM           : {len(self._flat_cache)} tensors")
+        else:
+            logger.info(f"  LRU handles      : max {self._max_sf_handles}")
+        logger.info("=" * 60)
+
+    def _collect_sf_files(self, d: Path) -> list[Path]:
+        """
+        Collect all safetensors files in directory *d* following priority order:
+          1. Single merged file at root.
+          2. Per-class or generic chunks in chunks/ subdirectory.
+          3. Any *.safetensors at root level.
+        """
+        files: list[Path] = []
+
+        # Priority 1: single merged file
+        root_sf = d / "audio_embeddings.safetensors"
+        if root_sf.exists():
+            files.append(root_sf)
+            return files
+
+        # Priority 2: chunks/ subdirectory (per-class or generic)
+        chunks_dir = d / "chunks"
+        if chunks_dir.exists():
+            found = sorted(chunks_dir.glob("*.safetensors"))
+            if found:
+                files.extend(found)
+                return files
+
+        # Priority 3: any .safetensors at root
+        root_sfs = sorted(d.glob("*.safetensors"))
+        if root_sfs:
+            files.extend(root_sfs)
+
+        return files
+
+    def _index_legacy_pt(self, d: Path, sample_shape: list | None) -> None:
+        """Index legacy torch.save .pt chunks from *d* (backward compatibility)."""
+        legacy_files = sorted(d.glob("audio_embeddings_*.pt"))
+        if not legacy_files:
+            return
+        logger.warning(
+            f"  [LEGACY] Found {len(legacy_files)} .pt chunks in {d}. "
+            "Consider re-running preprocess to produce safetensors chunks."
+        )
+        for chunk_file in legacy_files:
+            self._total_size_mb += chunk_file.stat().st_size / (1024 ** 2)
+            try:
                 chunk = _safe_torch_load(chunk_file)
                 for audio_id, tensor in chunk.items():
-                    self._index[audio_id] = chunk_file.name
-                    if sample_shape is None:
-                        sample_shape = list(tensor.shape)
                     if self._preload_all:
                         t = tensor.squeeze(0) if tensor.dim() == 3 else tensor
                         self._flat_cache[audio_id] = t
+                        self._index[audio_id]      = True
+                    else:
+                        self._index[audio_id] = str(chunk_file)
                 if not self._preload_all:
                     del chunk
+            except Exception as exc:
+                logger.warning(f"  Cannot read {chunk_file}: {exc} — skipped.")
 
-            logger.info("=" * 60)
-            logger.info("[AUDIO EMBEDDINGS] legacy .pt chunks loaded:")
-            logger.info(f"Format        : torch .pt  (legacy)")
-            logger.info(f"Chunk files   : {len(legacy_files)}")
-            logger.info(f"Total audio   : {len(self._index)}")
-            logger.info(f"Total size    : {total_size_mb:.1f} MB")
-            logger.info(f"Tensor shape  : {sample_shape}  (dtype: float16)")
-            if self._preload_all:
-                logger.info(f"In RAM        : {len(self._flat_cache)} embeddings")
-            logger.info("=" * 60)
-
-        else:
-            raise FileNotFoundError(
-                f"No audio_embeddings.safetensors, chunks/ dir, or audio_embeddings_*.pt "
-                f"found in {self.embeddings_dir}. "
-                "Run preprocess_audio_embeddings_colab.py first."
-            )
-
+    # ──────────────────────────────────────────────────────────────────────────
     def __contains__(self, audio_id: str) -> bool:
         return audio_id in self._index
 
     def __len__(self) -> int:
-        return len(self._index)
+        return self._total_ids
 
     def get(self, audio_id: str) -> torch.Tensor:
         if audio_id not in self._index:
             raise KeyError(
-                f"Audio '{audio_id}' not found in embeddings. "
-                "Re-run preprocess_audio_embeddings_colab.py."
+                f"Audio '{audio_id}' not found in any of: "
+                + ", ".join(str(d) for d in self._dirs)
+                + ". Re-run preprocess_audio_embeddings_colab.py."
             )
 
-        # preload_all=True → serve directly from RAM (same for all modes)
+        # preload_all=True → serve directly from RAM
         if self._preload_all:
             t = self._flat_cache[audio_id]
             return t if t.is_contiguous() else t.contiguous()
 
-        # preload_all=False, single safetensors → lazy mmap read
-        if self._mode == "safetensors":
-            t = self._sf.get_tensor(audio_id)
-            t = t.squeeze(0) if t.dim() == 3 else t
-            return t if t.is_contiguous() else t.contiguous()
+        source = self._index[audio_id]
 
-        # preload_all=False, chunked safetensors → LRU cache of file handles
-        if self._mode == "chunked_safetensors":
-            chunk_path_str = self._index[audio_id]
-            if chunk_path_str not in self._sf_handles:
-                # Evict the oldest handle if the cache is full.
-                if len(self._sf_handles) >= self._max_sf_handles:
-                    oldest = self._sf_lru.popleft()
-                    del self._sf_handles[oldest]
-                self._sf_handles[chunk_path_str] = open_safetensors(chunk_path_str)
-                self._sf_lru.append(chunk_path_str)
-            else:
-                # Move to most-recently-used position.
-                try:
-                    self._sf_lru.remove(chunk_path_str)
-                except ValueError:
-                    pass
-                self._sf_lru.append(chunk_path_str)
-            t = self._sf_handles[chunk_path_str].get_tensor(audio_id)
-            t = t.squeeze(0) if t.dim() == 3 else t
-            return t if t.is_contiguous() else t.contiguous()
-
-        # preload_all=False, legacy .pt → LRU cache of loaded chunk dicts
-        chunk_name = self._index[audio_id]
-        if chunk_name not in self._lru_cache:
-            if len(self._lru_cache) >= self._max_cached_chunks:
-                oldest = self._lru.popleft()
-                del self._lru_cache[oldest]
-            self._lru_cache[chunk_name] = _safe_torch_load(
-                self.embeddings_dir / chunk_name
+        if source is True:
+            raise RuntimeError(
+                f"Internal error: index['{audio_id}'] is True but preload_all=False"
             )
-            self._lru.append(chunk_name)
+
+        if source.endswith(".safetensors"):
+            return self._get_from_sf(audio_id, source)
+        else:
+            return self._get_from_pt(audio_id, source)
+
+    def _get_from_sf(self, audio_id: str, sf_path_str: str) -> torch.Tensor:
+        """LRU-cached safe_open handle → single tensor read."""
+        if sf_path_str not in self._sf_handles:
+            if len(self._sf_handles) >= self._max_sf_handles:
+                oldest = self._sf_lru.popleft()
+                self._sf_handles.pop(oldest, None)
+            self._sf_handles[sf_path_str] = open_safetensors(sf_path_str)
+            self._sf_lru.append(sf_path_str)
         else:
             try:
-                self._lru.remove(chunk_name)
+                self._sf_lru.remove(sf_path_str)
             except ValueError:
                 pass
-            self._lru.append(chunk_name)
-        tensor = self._lru_cache[chunk_name][audio_id]
+            self._sf_lru.append(sf_path_str)
+
+        t = self._sf_handles[sf_path_str].get_tensor(audio_id)
+        t = t.squeeze(0) if t.dim() == 3 else t
+        return t if t.is_contiguous() else t.contiguous()
+
+    def _get_from_pt(self, audio_id: str, pt_path_str: str) -> torch.Tensor:
+        """LRU-cached .pt chunk dict → single tensor access."""
+        if pt_path_str not in self._lru_cache:
+            if len(self._lru_cache) >= self._max_cached_chunks:
+                oldest = self._lru.popleft()
+                self._lru_cache.pop(oldest, None)
+            self._lru_cache[pt_path_str] = _safe_torch_load(pt_path_str)
+            self._lru.append(pt_path_str)
+        else:
+            try:
+                self._lru.remove(pt_path_str)
+            except ValueError:
+                pass
+            self._lru.append(pt_path_str)
+
+        tensor = self._lru_cache[pt_path_str][audio_id]
         tensor = tensor.squeeze(0) if tensor.dim() == 3 else tensor
         return tensor if tensor.is_contiguous() else tensor.contiguous()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LazyLatentIndex
+# ─────────────────────────────────────────────────────────────────────────────
 
 class LazyLatentIndex:
     """
     Provides access to precomputed VAE image latents from disk.
 
-    Mirrors the structure of LazyEmbeddingIndex but for image latents
-    generated by preprocess_image_latents_colab.py.
     Each value is a [4, H/8, W/8] float16 tensor (e.g. [4, 64, 64] at 512px).
-
     Supports safetensors (preferred) and legacy .pt chunks.
     preload_all=True loads the entire index into RAM (~37 MB for 1500 images).
     preload_all=False uses lazy mmap via safe_open.
@@ -308,17 +333,16 @@ class LazyLatentIndex:
         self._index: dict   = {}
         self._flat_cache: dict = {}
         self._sf            = None
-        self._lru_cache: dict          = {}
-        self._lru: collections.deque   = collections.deque()
-        self._max_cached_chunks: int   = 4
-        self._mode: str                = "unknown"
+        self._lru_cache: dict         = {}
+        self._lru: collections.deque  = collections.deque()
+        self._max_cached_chunks: int  = 4
+        self._mode: str               = "unknown"
         self._build_index()
 
     def _build_index(self):
         sf_file      = self.latents_dir / "image_latents.safetensors"
         legacy_files = sorted(self.latents_dir.glob("image_latents_*.pt"))
 
-        # ── SAFETENSORS ────────────────────────────────────────────────────
         if sf_file.exists():
             self._mode    = "safetensors"
             total_size_mb = sf_file.stat().st_size / (1024 ** 2)
@@ -346,24 +370,19 @@ class LazyLatentIndex:
                     sample_shape = list(self._sf.get_tensor(keys[0]).shape)
 
             logger.info("=" * 60)
-            logger.info("[IMAGE LATENTS] safetensors loaded successfully:")
-            logger.info(f"Format        : safetensors")
-            logger.info(f"Mode          : {mode_label}")
-            logger.info(f"Total images  : {len(self._index)}")
-            logger.info(f"File size     : {total_size_mb:.1f} MB")
-            logger.info(f"Tensor shape  : {sample_shape}  (dtype: float16)")
-            logger.info(f"File          : {sf_file}")
-            if self._preload_all:
-                logger.info(f"In RAM        : {len(self._flat_cache)} latents")
+            logger.info("[IMAGE LATENTS] safetensors loaded:")
+            logger.info(f"  Total images : {len(self._index)}")
+            logger.info(f"  Size         : {total_size_mb:.1f} MB")
+            logger.info(f"  Shape        : {sample_shape}  (float16)")
+            logger.info(f"  Mode         : {mode_label}")
             logger.info("=" * 60)
 
-        # ── LEGACY .pt ─────────────────────────────────────────────────────
         elif legacy_files:
             self._mode = "legacy_pt"
             logger.warning(
-                f"LazyLatentIndex: no image_latents.safetensors found. "
-                f"Using {len(legacy_files)} legacy .pt chunks. "
-                f"Re-run preprocess_image_latents_colab.py to migrate to safetensors."
+                f"LazyLatentIndex: no image_latents.safetensors found — "
+                f"using {len(legacy_files)} legacy .pt chunks. "
+                "Re-run preprocess_image_latents_colab.py to migrate."
             )
             total_size_bytes = sum(f.stat().st_size for f in legacy_files)
             total_size_mb    = total_size_bytes / (1024 ** 2)
@@ -382,13 +401,9 @@ class LazyLatentIndex:
 
             logger.info("=" * 60)
             logger.info("[IMAGE LATENTS] legacy .pt chunks loaded:")
-            logger.info(f"Format        : torch .pt  (legacy)")
-            logger.info(f"Chunk files   : {len(legacy_files)}")
-            logger.info(f"Total images  : {len(self._index)}")
-            logger.info(f"Total size    : {total_size_mb:.1f} MB")
-            logger.info(f"Tensor shape  : {sample_shape}  (dtype: float16)")
-            if self._preload_all:
-                logger.info(f"In RAM        : {len(self._flat_cache)} latents")
+            logger.info(f"  Total images : {len(self._index)}")
+            logger.info(f"  Size         : {total_size_mb:.1f} MB")
+            logger.info(f"  Shape        : {sample_shape}  (float16)")
             logger.info("=" * 60)
 
         else:
@@ -411,17 +426,15 @@ class LazyLatentIndex:
                 "Re-run preprocess_image_latents_colab.py."
             )
 
-        # preload_all=True → serve from RAM
         if self._preload_all:
             t = self._flat_cache[image_id]
             return t if t.is_contiguous() else t.contiguous()
 
-        # preload_all=False, safetensors → lazy mmap
         if self._mode == "safetensors":
             t = self._sf.get_tensor(image_id)
             return t if t.is_contiguous() else t.contiguous()
 
-        # preload_all=False, legacy .pt → LRU cache of chunk dicts
+        # legacy .pt — LRU cache of chunk dicts
         chunk_name = self._index[image_id]
         if chunk_name not in self._lru_cache:
             if len(self._lru_cache) >= self._max_cached_chunks:
@@ -441,14 +454,22 @@ class LazyLatentIndex:
         return t if t.is_contiguous() else t.contiguous()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Museart Dataset
+# ─────────────────────────────────────────────────────────────────────────────
+
 class Museart(Dataset):
     """
-    PyTorch Dataset for the Museart music-to-art task.
+    PyTorch Dataset for the Museart music-to-art task (Early Fusion branch).
 
-    Each sample pairs a WAV audio file with a WikiArt image that belongs to
-    the same thematic class (e.g. "Impressionism", "Romanticism"). Audio and
-    image paths are resolved from CSV manifests; embeddings and latents are
-    served via LazyEmbeddingIndex / LazyLatentIndex to avoid runtime inference.
+    Each sample pairs a WAV audio file with a WikiArt image from the same class.
+    Audio embeddings are served via LazyEmbeddingIndex (supports comma-separated
+    multi-dataset dirs). Image latents are served via LazyLatentIndex.
+
+    NOTE: The Early Fusion architecture does NOT use a <*> placeholder injection.
+    The placeholder token appears in the prompt template only so that existing
+    tokenised caches remain compatible; its embedding is treated as a normal
+    text token by EarlyFusionEncoder.
     """
 
     def __init__(
@@ -460,16 +481,16 @@ class Museart(Dataset):
         interpolation='bicubic',
         preloaded_embeddings=None,
     ):
-        self.tokenizer = tokenizer
-        self.size = size
+        self.tokenizer         = tokenizer
+        self.size              = size
         self.placeholder_token = args.placeholder_token
-        self.data_set = args.data_set
-        self.input_length = args.input_length
+        self.data_set          = args.data_set
+        self.input_length      = args.input_length
 
         self.image_root_dir = os.path.join(args.data_dir, 'images', self.data_set)
-        self.audio_root_dir = os.path.join(args.data_dir, 'audio', self.data_set)
+        self.audio_root_dir = os.path.join(args.data_dir, 'audio',  self.data_set)
 
-        # Accept CSV in either <data_dir>/images/images.csv or <data_dir>/images.csv
+        # CSV resolution: try canonical path, fall back to root
         csv_img_path = os.path.join(args.data_dir, 'images', 'images.csv')
         if not os.path.exists(csv_img_path):
             csv_img_path = os.path.join(args.data_dir, 'images.csv')
@@ -480,7 +501,6 @@ class Museart(Dataset):
         self.df_image = pd.read_csv(csv_img_path)
         self.df_audio = pd.read_csv(csv_aud_path)
 
-        # Ensure IDs are strings and the 'set' column is lowercase for safe comparison.
         for col in ['id']:
             if col in self.df_audio.columns:
                 self.df_audio[col] = self.df_audio[col].astype(str)
@@ -492,13 +512,13 @@ class Museart(Dataset):
 
         self.image_path: list = []
         self.audio_path: list = []
-        self.label: list = []
+        self.label:      list = []
 
-        self.center_crop = args.center_crop if self.data_set in ('train', 'validation') \
-            else False
+        self.center_crop = (
+            args.center_crop if self.data_set in ('train', 'validation') else False
+        )
 
-        # Walk the audio/image directories once at init with followlinks=True
-        # for robust Colab/Kaggle symlink support.
+        # Walk directories once at init with followlinks=True
         self.audio_id_to_path = {}
         for root, dirs, files in os.walk(self.audio_root_dir, followlinks=True):
             for f in files:
@@ -518,20 +538,18 @@ class Museart(Dataset):
         self.prepare_dataset(set(self.audio_id_to_path.keys()))
 
         self.num_samples = len(self.audio_path)
-        self._length = self.num_samples
+        self._length     = self.num_samples
         logger.info(f"{self.data_set}: {self.num_samples} samples")
 
         self.interpolation = {
-            "linear": PIL_INTERPOLATION["linear"],
+            "linear":   PIL_INTERPOLATION["linear"],
             "bilinear": PIL_INTERPOLATION["bilinear"],
-            "bicubic": PIL_INTERPOLATION["bicubic"],
-            "lanczos": PIL_INTERPOLATION["lanczos"],
+            "bicubic":  PIL_INTERPOLATION["bicubic"],
+            "lanczos":  PIL_INTERPOLATION["lanczos"],
         }[interpolation]
         self.templates = imagenet_templates_small
 
-        # Pre-tokenise all templates once; txt_proc() just samples from this list.
-        # Tokenisation costs ~0.5 ms/call; pre-computing saves ~80 s over 20 k steps.
-        # Tensors are made contiguous here so there is zero overhead in the hot loop.
+        # Pre-tokenise all templates once (saves ~80 s over a 20 k-step run)
         _placeholder = args.placeholder_token
         self._cached_input_ids = [
             self.tokenizer(
@@ -541,34 +559,42 @@ class Museart(Dataset):
             ).input_ids[0].contiguous()
             for tmpl in self.templates
         ]
-        # Cache len to avoid calling len() inside __getitem__.
         self._n_templates = len(self._cached_input_ids)
 
+        # ── Audio embeddings index ─────────────────────────────────────────
         if preloaded_embeddings is not None:
             self.audio_embeddings = preloaded_embeddings
-            logger.info(f"Embeddings: {type(preloaded_embeddings).__name__} "
-                        f"({len(self.audio_embeddings)} audio)")
+            logger.info(
+                f"Embeddings: {type(preloaded_embeddings).__name__} "
+                f"({len(self.audio_embeddings)} audio)"
+            )
         elif hasattr(args, 'embeddings_dir') and args.embeddings_dir:
-            self.audio_embeddings = LazyEmbeddingIndex(args.embeddings_dir)
-            logger.info(f"LazyEmbeddingIndex: {len(self.audio_embeddings)} audio")
+            self.audio_embeddings = LazyEmbeddingIndex(
+                args.embeddings_dir,
+                preload_all    = getattr(args, 'embeddings_preload_all',    True),
+                max_sf_handles = getattr(args, 'embeddings_max_sf_handles', 8),
+            )
+            logger.info(
+                f"LazyEmbeddingIndex: {len(self.audio_embeddings)} audio  "
+                f"(dirs: {args.embeddings_dir})"
+            )
         else:
             self.audio_embeddings = None
-            logger.warning("No embeddings_dir specified.")
+            logger.warning("No embeddings_dir specified — audio_embeddings unavailable.")
 
-        # If image_latents_dir is given, bypass img_proc() and serve precomputed latents.
+        # ── Image latents index ────────────────────────────────────────────
         image_latents_dir = getattr(args, 'image_latents_dir', None)
         if image_latents_dir:
             self.image_latents = LazyLatentIndex(image_latents_dir)
             logger.info(
-                f"LazyLatentIndex: {len(self.image_latents)} image latents "
+                f"LazyLatentIndex: {len(self.image_latents)} latents "
                 f"(img_proc bypassed)"
             )
         else:
             self.image_latents = None
-            logger.info("image_latents_dir not specified: using img_proc() at runtime.")
+            logger.info("image_latents_dir not set: using img_proc() at runtime.")
 
-        # Pre-allocated constant bool tensors to avoid torch.tensor(True/False)
-        # on every __getitem__ call (~320 k allocations saved over a 20 k-step run).
+        # Pre-allocated constant bool tensors (avoids allocation in hot loop)
         self._TRUE  = torch.tensor(True)
         self._FALSE = torch.tensor(False)
 
@@ -577,12 +603,10 @@ class Museart(Dataset):
 
     def prepare_dataset(self, samples_audio):
         """
-        Populate self.audio_path / image_path / label lists.
-
-        Uses set_index + groupby for O(1) per-sample lookup instead of the
-        naive O(n²) DataFrame scan inside the loop.
+        Populate audio_path / image_path / label lists.
+        Uses set_index + groupby for O(1) per-sample lookup.
         """
-        music_indexed = self.df_music.set_index('id')
+        music_indexed   = self.df_music.set_index('id')
         images_by_class = {
             cls: grp['id'].tolist()
             for cls, grp in self.df_images.groupby('class')
@@ -600,7 +624,6 @@ class Museart(Dataset):
                 continue
             image_id = random.choice(candidate_ids)
 
-            # Try exact id, then lowercased+underscored variant, then disk search.
             _img_id_str  = str(image_id)
             _img_id_norm = _img_id_str.lower().replace(" ", "_")
             img_path = (
@@ -608,17 +631,16 @@ class Museart(Dataset):
                 or self.image_id_to_path.get(_img_id_norm)
             )
             if not img_path:
-                # Direct disk search: try both underscore and dash filename variants.
                 cls_folder = str(label).replace(" ", "_").replace("/", "-")
-                cls_dir = Path(self.image_root_dir) / cls_folder
-                _found = False
-                _id_with_dashes = _img_id_str.replace("_", "-")
+                cls_dir    = Path(self.image_root_dir) / cls_folder
+                _found     = False
+                _id_dash   = _img_id_str.replace("_", "-")
                 for ext in ('.jpg', '.jpeg', '.png', '.webp', '.tiff'):
-                    for _name in (_img_id_str, _id_with_dashes):
-                        _candidate = cls_dir / f"{_name}{ext}"
-                        if _candidate.exists():
-                            img_path = str(_candidate)
-                            self.image_id_to_path[_img_id_str] = img_path  # cache hit
+                    for _name in (_img_id_str, _id_dash):
+                        _cand = cls_dir / f"{_name}{ext}"
+                        if _cand.exists():
+                            img_path = str(_cand)
+                            self.image_id_to_path[_img_id_str] = img_path
                             _found = True
                             break
                     if _found:
@@ -637,21 +659,25 @@ class Museart(Dataset):
         if self.center_crop:
             h, w = img.shape[0], img.shape[1]
             crop = min(h, w)
-            img = img[(h - crop) // 2:(h + crop) // 2,
-                      (w - crop) // 2:(w + crop) // 2]
-        image = Image.fromarray(img).resize((self.size, self.size), resample=self.interpolation)
+            img  = img[(h - crop) // 2:(h + crop) // 2,
+                       (w - crop) // 2:(w + crop) // 2]
+        image = Image.fromarray(img).resize(
+            (self.size, self.size), resample=self.interpolation
+        )
         image = (np.array(image, dtype=np.float32) / 127.5 - 1.0)
         return torch.from_numpy(image).permute(2, 0, 1)
 
     def aud_proc_beats(self, aud_path: str) -> torch.Tensor:
         """Retrieve a precomputed audio embedding for the given file path."""
         if self.audio_embeddings is None:
-            raise ValueError("audio_embeddings not available. Specify --embeddings_dir.")
+            raise ValueError(
+                "audio_embeddings not available. Specify --embeddings_dir."
+            )
         audio_id = Path(aud_path).stem
         if isinstance(self.audio_embeddings, LazyEmbeddingIndex):
             t = self.audio_embeddings.get(audio_id)
-            # Ensure contiguity once here in the worker thread so collate can use fast memcpy.
             return t if t.is_contiguous() else t.contiguous()
+        # Fallback for dict-like preloaded embeddings
         feat = self.audio_embeddings.get(audio_id, None)
         if feat is None:
             raise KeyError(f"Audio '{audio_id}' not found in embeddings.")
@@ -660,33 +686,28 @@ class Museart(Dataset):
 
     def txt_proc(self) -> torch.Tensor:
         """Return a random pre-tokenised template input_ids tensor."""
-        # random.randrange avoids the internal len() call inside random.choice.
         return self._cached_input_ids[random.randrange(self._n_templates)]
 
     def __getitem__(self, idx):
-        # Retry loop: if an image or latent is missing, try the next sample
-        # instead of crashing the DataLoader worker.
+        # Retry loop: if an image or latent is missing, try the next sample.
         for _retry in range(self.num_samples):
-            _idx = (idx + _retry) % self.num_samples
+            _idx       = (idx + _retry) % self.num_samples
             aud_path   = self.audio_path[_idx]
             image_path = self.image_path[_idx]
             image_id   = Path(image_path).stem
-
             _img_id_norm = image_id.lower().replace(" ", "_")
 
             if self.image_latents is not None:
                 if image_id in self.image_latents:
-                    pixel_values = self.image_latents.get(image_id)
+                    pixel_values          = self.image_latents.get(image_id)
                     is_precomputed_latent = self._TRUE
                     break
                 elif _img_id_norm in self.image_latents:
-                    pixel_values = self.image_latents.get(_img_id_norm)
-                    image_id = _img_id_norm
+                    pixel_values          = self.image_latents.get(_img_id_norm)
+                    image_id              = _img_id_norm
                     is_precomputed_latent = self._TRUE
                     break
                 else:
-                    # Keep the batch homogeneous [B, 4, H/8, W/8]: no fallback to
-                    # img_proc() to avoid shape mismatches in the collate function.
                     if _retry == 0:
                         logger.warning(
                             f"[SKIP] missing latent for image_id='{image_id}' "
@@ -695,7 +716,7 @@ class Museart(Dataset):
                     continue
             else:
                 if os.path.isfile(image_path):
-                    pixel_values = self.img_proc(image_path)
+                    pixel_values          = self.img_proc(image_path)
                     is_precomputed_latent = self._FALSE
                     break
                 else:
