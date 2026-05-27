@@ -1,5 +1,11 @@
 # @title train_validation_no_accel_colab.py
-"""DDP Training & Validation for Musipainter."""
+"""DDP Training & Validation for Musipainter (Early Fusion branch).
+
+Supports single-GPU and multi-GPU (torchrun) modes.
+Audio embeddings are loaded via LazyEmbeddingIndex which accepts a
+comma-separated --embeddings_dir pointing to one or more Kaggle Dataset
+directories (per-class chunks, merged safetensors, or legacy .pt).
+"""
 
 import argparse
 import gc
@@ -146,7 +152,7 @@ def save_checkpoint(embedder, optimizer, scaler, lr_scheduler, global_step,
         "scaler_state_dict":       scaler.state_dict(),
         "lr_scheduler_state_dict": lr_scheduler.state_dict(),
         "timestamp":               timestamp,
-        "arch":                    "early_fusion_v9",  # tag for identification
+        "arch":                    "early_fusion_v9",
     }
     if lora_layers is not None:
         ckpt["lora_state_dict"] = lora_layers.state_dict()
@@ -172,18 +178,15 @@ def load_checkpoint(resume_path, embedder, optimizer, scaler, lr_scheduler,
     best_vloss      = ckpt.get("best_vloss", float('inf'))
     best_model_path = ckpt.get("best_model_path", None)
     if best_model_path is not None and not os.path.exists(best_model_path):
-        logger.warning(f"[RESUME] best_model_path not found: {best_model_path}.")
+        logger.warning(f"[RESUME] best_model_path not found on disk: {best_model_path}.")
         best_model_path = None
     _arch = ckpt.get("arch", "late_fusion_v8")
     if _arch != "early_fusion_v9":
         logger.warning(
             f"[RESUME] Checkpoint arch='{_arch}' — was trained with Late Fusion. "
-            "Weights may not be compatible with EarlyFusionEncoder. "
-            "Consider starting from scratch with --resume_from_checkpoint=None."
+            "Weights may not be compatible with EarlyFusionEncoder."
         )
-    logger.info(
-        f"[RESUME] Resuming from step={global_step}, best_vloss={best_vloss:.4f}."
-    )
+    logger.info(f"[RESUME] Resuming from step={global_step}, best_vloss={best_vloss:.4f}.")
     return global_step, best_vloss, best_model_path
 
 
@@ -192,31 +195,22 @@ def load_embedder_weights(weight_path, embedder, device, resume_step: int = 0):
     if not os.path.exists(resolved) and resolved.endswith(".bin"):
         sf_candidate = resolved[:-4] + ".safetensors"
         if os.path.exists(sf_candidate):
-            logger.info(
-                f"[RESUME-WEIGHTS] .bin not found, using .safetensors: {sf_candidate}"
-            )
+            logger.info(f"[RESUME-WEIGHTS] .bin not found, using .safetensors: {sf_candidate}")
             resolved = sf_candidate
     if not os.path.exists(resolved):
-        raise FileNotFoundError(
-            f"[RESUME-WEIGHTS] Weight file not found: {resolved}"
-        )
+        raise FileNotFoundError(f"[RESUME-WEIGHTS] Weight file not found: {resolved}")
     logger.info(f"[RESUME-WEIGHTS] Loading embedder weights from: {resolved}")
     if resolved.endswith(".safetensors"):
         from modules.preprocess.utils import load_safetensors
         state_dict = load_safetensors(resolved, device=str(device))
     else:
         state_dict = torch.load(resolved, map_location=device, weights_only=True)
-    missing, unexpected = _unwrap_compiled(embedder).load_state_dict(
-        state_dict, strict=True
-    )
+    missing, unexpected = _unwrap_compiled(embedder).load_state_dict(state_dict, strict=True)
     if missing:
         logger.warning(f"[RESUME-WEIGHTS] Missing keys: {missing}")
     if unexpected:
         logger.warning(f"[RESUME-WEIGHTS] Unexpected keys: {unexpected}")
-    logger.info(
-        f"[RESUME-WEIGHTS] EarlyFusionEncoder loaded from: {resolved} "
-        f"(resume_step={resume_step})"
-    )
+    logger.info(f"[RESUME-WEIGHTS] EarlyFusionEncoder loaded (resume_step={resume_step})")
     return resume_step, float('inf')
 
 
@@ -228,34 +222,18 @@ def build_label_embedding_cache(tokenizer, token_embedding, all_labels, device):
     """
     Pre-compute cosine-loss target vectors for each unique art style label.
 
-    Early-Fusion change:
-      Uses base_model.token_embedding (the frozen CLIP nn.Embedding table)
-      directly instead of text_encoder.get_input_embeddings().
-      Semantics are identical: mean of CLIP token embedding vectors for the
-      label text tokens (excluding BOS/EOS).
-
-    Args:
-        tokenizer:       CLIPTokenizer instance.
-        token_embedding: frozen nn.Embedding — base_model.token_embedding.
-        all_labels:      list of label strings from train + validation datasets.
-        device:          GPU device.
-
-    Returns:
-        label_list:    sorted list of unique labels.
-        label_to_idx:  dict {label: row_index_in_label_matrix}.
-        label_matrix:  [N_labels, text_dim] float32 GPU tensor.
+    Uses base_model.token_embedding (frozen CLIP nn.Embedding) directly;
+    semantics: mean of CLIP token embeddings for label words (excluding BOS/EOS).
     """
     label_list = sorted(set(all_labels))
     vecs = []
     valid_labels = []
     for label in label_list:
-        # Tokenise the label; strip BOS (index 0) and EOS (last non-pad token).
         ids = tokenizer([label]).data['input_ids'][0][1:-1]
         if not ids:
             continue
         ids_t = torch.tensor(ids, device=device)
         with torch.no_grad():
-            # token_embedding is float16; cast to float32 for the loss computation.
             vec = token_embedding(ids_t).float().mean(dim=0).detach()
         vecs.append(vec)
         valid_labels.append(label)
@@ -270,7 +248,7 @@ def build_label_embedding_cache(tokenizer, token_embedding, all_labels, device):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  VAE PRECOMPUTE (unchanged from v8)
+#  VAE PRECOMPUTE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def precompute_vae_latents(vae, dataloader, device, use_amp):
@@ -301,7 +279,7 @@ def precompute_vae_latents(vae, dataloader, device, use_amp):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  DISK / TB UTILITIES (unchanged)
+#  DISK / TB UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _dir_size_mb(path: str) -> float:
@@ -432,7 +410,6 @@ def parse_args():
     parser.add_argument("--validation_batch_size", type=int, default=4)
     parser.add_argument("--lora", type=_str2bool, default=False)
     parser.add_argument("--revision", type=str, default=None, required=False)
-    parser.add_argument("--embeddings_dir", type=str, default="./audio_embeddings/")
     parser.add_argument("--use_precomputed_embeddings", type=_str2bool, default=True)
     parser.add_argument("--validate_every_n_epochs", type=int, default=5)
     parser.add_argument("--validate_every_n_steps", type=int, default=0)
@@ -447,7 +424,8 @@ def parse_args():
     parser.add_argument("--keep_last_n_checkpoints", type=int, default=2)
     parser.add_argument("--hf_cache_dir", type=str, default="/tmp/hf_model_cache")
     parser.add_argument("--latents_dir", type=str, default="./image_latents/")
-    # Early Fusion hyper-parameters
+
+    # ── Early Fusion hyper-parameters ────────────────────────────────────────
     parser.add_argument("--ef_d_model", type=int, default=512,
                         help="EarlyFusionEncoder shared Transformer hidden dim.")
     parser.add_argument("--ef_nhead", type=int, default=8,
@@ -523,14 +501,11 @@ def train_validation():
             cache_dir=_hf_cache,
         )
 
-    # The tokenizer is used only to convert text labels/prompts to token IDs
-    # for the label embedding cache and the Museart dataset.
-    # We keep args.placeholder_token so the Museart dataset templates work
-    # as before (the token appears in the template string but is now just
-    # treated as a regular vocabulary token by the embedding lookup).
+    # Early Fusion: no placeholder injection into CLIP.
+    # The tokenizer is used only to convert text labels/prompts to token IDs.
     logger.info(
-        "Tokenizer loaded — no placeholder token addition required. "
-        "No <*> injection into CLIP."
+        "Tokenizer loaded — Early Fusion mode: "
+        "no <*> injection into CLIP text encoder."
     )
 
     noise_scheduler = DDPMScheduler.from_pretrained(
@@ -560,6 +535,13 @@ def train_validation():
         writer = None
 
     # ── Datasets ─────────────────────────────────────────────────────────────
+    if is_main:
+        logger.info(
+            f"Audio embeddings dir(s): {args.embeddings_dir}  "
+            f"[preload_all={args.embeddings_preload_all}, "
+            f"max_sf_handles={args.embeddings_max_sf_handles}]"
+        )
+
     args.data_set = 'train'
     train_dataset = Museart(args=args, tokenizer=tokenizer, logger=logger)
 
@@ -598,9 +580,6 @@ def train_validation():
     model = MusicTokenWrapper(args)
     base_model = model
 
-    # The token_embedding table is already sized for the full CLIP vocabulary
-    # and is never modified.
-
     # ── VAE precompute ─────────────────────────────────────────────────────────
     train_latent_cache = {}
     valid_latent_cache = {}
@@ -609,7 +588,7 @@ def train_validation():
     validation_dataset = Museart(args=args, tokenizer=tokenizer, logger=logger)
     args.data_set = 'train'
 
-    if args.precompute_vae_latents:
+    if args.use_precompute_vae_latents:
         if args.latents_dir:
             train_latent_cache = None
             valid_latent_cache = None
@@ -660,13 +639,12 @@ def train_validation():
         base_model.early_fusion = torch.compile(
             base_model.early_fusion, mode="default", fullgraph=False
         )
-        # Keep the embedder alias in sync
         base_model.embedder = base_model.early_fusion
         if is_main:
             logger.info("EarlyFusionEncoder compiled.")
     except Exception as e:
         if is_main:
-            logger.info(f"Skipped: {e}")
+            logger.info(f"torch.compile skipped: {e}")
 
     if is_ddp:
         _find_unused = args.lora
@@ -777,10 +755,10 @@ def train_validation():
     )
 
     n_workers_loop = (
-        args.workers_after_precompute if args.precompute_vae_latents
+        args.workers_after_precompute if args.use_precompute_vae_latents
         else args.dataloader_num_workers
     )
-    if args.precompute_vae_latents and n_workers_loop != args.dataloader_num_workers:
+    if args.use_precompute_vae_latents and n_workers_loop != args.dataloader_num_workers:
         if is_main:
             logger.info(
                 f"Recreating train_dataloader: "
@@ -801,10 +779,10 @@ def train_validation():
             len(train_dataloader) / args.gradient_accumulation_steps
         )
 
-    n_gpus     = world_size
+    n_gpus      = world_size
     total_batch = args.train_batch_size * args.gradient_accumulation_steps * n_gpus
 
-    # ── Label embedding cache (Early Fusion version) ───────────────────────────
+    # ── Label embedding cache ─────────────────────────────────────────────────
     _label_to_idx = None
     _label_matrix = None
     if args.cosine_loss:
@@ -835,9 +813,12 @@ def train_validation():
         logger.info(f"ef_dropout          : {args.ef_dropout}")
         logger.info(f"cosine_loss         : {args.cosine_loss}")
         logger.info(f"trainable params    : {n_trainable:,}")
+        logger.info(f"embeddings_dir      : {args.embeddings_dir}")
+        logger.info(f"embeddings_preload  : {args.embeddings_preload_all}")
+        logger.info(f"latents_dir         : {args.latents_dir}")
         logger.info("=" * 60)
 
-    # ── Helper: single validation pass ───────────────────────────────────────
+    # ── Helper: single validation pass ────────────────────────────────────────
     def _run_validation(v_loader, v_latent_cache):
         model.eval()
         running_vloss = 0.0
@@ -946,7 +927,6 @@ def train_validation():
             input_ids      = batch["input_ids"]
 
             with autocast(enabled=use_amp):
-                # Latents
                 is_pre = batch.get("is_precomputed_latent", None)
                 if is_pre is not None and bool(is_pre.all()):
                     latents = batch["pixel_values"].to(dtype=torch.float16)
@@ -971,9 +951,9 @@ def train_validation():
                     _ts_buf = torch.empty((bsz,), dtype=torch.long, device=device)
                 _noise_buf.normal_()
                 _ts_buf.random_(0, noise_scheduler.config.num_train_timesteps)
-                noise          = _noise_buf
-                timesteps      = _ts_buf
-                noisy_latents  = noise_scheduler.add_noise(latents, noise, timesteps)
+                noise         = _noise_buf
+                timesteps     = _ts_buf
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 if _prediction_type == "epsilon":
                     target = noise
@@ -990,7 +970,6 @@ def train_validation():
 
                 loss = F.mse_loss(model_pred, target, reduction="mean")
 
-                # L1 regularisation on fused embedding
                 _reg = args.lambda_a * torch.mean(torch.abs(fused_embed))
                 if args.lambda_b > 0:
                     _reg = _reg + args.lambda_b * (
@@ -998,7 +977,6 @@ def train_validation():
                     ).mean()
                 loss = loss + _reg
 
-                # Cosine loss: align fused embedding with CLIP label vectors
                 if args.cosine_loss and _label_to_idx is not None:
                     labels   = batch['label']
                     row_idxs = [
@@ -1010,14 +988,14 @@ def train_validation():
                         if lbl in _label_to_idx
                     ]
                     if row_idxs:
-                        idx_t    = torch.tensor(row_idxs, dtype=torch.long, device=device)
+                        idx_t     = torch.tensor(row_idxs, dtype=torch.long, device=device)
                         aud_idx_t = torch.tensor(aud_idxs, dtype=torch.long, device=device)
-                        ct       = _label_matrix.index_select(0, idx_t)
-                        at       = fused_embed.index_select(0, aud_idx_t)
-                        em_n     = F.normalize(at.float(), dim=1)
-                        ct_n     = F.normalize(ct.float(), dim=1)
-                        cs       = (em_n * ct_n).sum(dim=1).mean()
-                        loss     = loss + args.lambda_c * (1 - cs) ** 2
+                        ct        = _label_matrix.index_select(0, idx_t)
+                        at        = fused_embed.index_select(0, aud_idx_t)
+                        em_n      = F.normalize(at.float(), dim=1)
+                        ct_n      = F.normalize(ct.float(), dim=1)
+                        cs        = (em_n * ct_n).sum(dim=1).mean()
+                        loss      = loss + args.lambda_c * (1 - cs) ** 2
 
                 loss = loss / args.gradient_accumulation_steps
 
@@ -1064,7 +1042,7 @@ def train_validation():
                         lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
                     )
 
-            # ── Periodic save ───────────────────────────────────────────────
+            # ── Periodic save ────────────────────────────────────────────────
             if is_main and global_step % args.save_steps == 0 and global_step > 0:
                 _ckpt_path = os.path.join(
                     args.output_dir,

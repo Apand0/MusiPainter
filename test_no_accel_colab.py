@@ -1,5 +1,12 @@
 # @title test_no_accel_colab.py
-"""Inference script for Musipainter."""
+"""
+Inference script for Musipainter (Early Fusion branch).
+
+Generates images from audio embeddings using EarlyFusionEncoder +
+frozen Stable Diffusion UNet. Audio embeddings are loaded via
+LazyEmbeddingIndex which accepts a comma-separated --embeddings_dir
+pointing to one or more Kaggle Dataset directories.
+"""
 
 import argparse
 import logging
@@ -28,6 +35,10 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 #  ARG PARSING
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ARG PARSING
+# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
     def _str2bool(v):
@@ -58,7 +69,6 @@ def parse_args():
     parser.add_argument("--revision", type=str, default=None, required=False)
     parser.add_argument("--tokenizer_name", type=str, default=None)
     parser.add_argument("--data_dir", type=str, default="./Museart/")
-    parser.add_argument("--embeddings_dir", type=str, default="./audio_embeddings/")
     parser.add_argument("--latents_dir", type=str, default="./image_latents/")
     parser.add_argument("--use_precomputed_embeddings", type=_str2bool, default=True)
     parser.add_argument("--placeholder_token", type=str, default="<*>")
@@ -87,14 +97,16 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=4.0)
     parser.add_argument("--center_crop", action="store_true", default=False)
     parser.add_argument("--hf_cache_dir", type=str, default="/tmp/hf_model_cache")
-    parser.add_argument("--uncond_mode", type=str, default="zeros",
-                        choices=["zeros", "text_only"],
-                        help=(
-                            "'zeros': unconditional embedding is all-zeros "
-                            "(fastest). 'text_only': unconditional embedding "
-                            "is the fused representation of the text prompt "
-                            "with a silent (zero) audio feature."
-                        ))
+    parser.add_argument(
+        "--uncond_mode", type=str, default="zeros",
+        choices=["zeros", "text_only"],
+        help=(
+            "'zeros': unconditional embedding is all-zeros (fastest). "
+            "'text_only': unconditional embedding is the fused representation "
+            "of the text prompt with a silent (zero) audio feature — CFG then "
+            "amplifies exactly the audio contribution above the text baseline."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -109,9 +121,26 @@ def parse_args():
     return args
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  CHECKPOINT RESOLUTION
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _resolve_checkpoint_path(explicit_path, output_dir, stem, label):
-    """Resolve best available checkpoint, supporting .bin → .safetensors fallback."""
+    """
+    Resolve best available checkpoint, supporting .bin → .safetensors fallback.
+
+    Search order:
+      1. explicit_path as provided
+      2. .safetensors sibling of a .bin explicit_path (format migration)
+      3. <output_dir>/<stem>.safetensors
+      4. <output_dir>/<stem>.bin
+      5. Most-recent best_model_<label>_*.safetensors in output_dir
+      6. Most-recent best_model_early_fusion_*.safetensors in output_dir
+      7. Most-recent weights/*_<label>-step*.safetensors in output_dir/weights/
+      8. Most-recent weights/*_early_fusion-step*.safetensors
+    """
     import glob
+
     candidates = [
         explicit_path,
         explicit_path.replace(".bin", ".safetensors")
@@ -122,6 +151,7 @@ def _resolve_checkpoint_path(explicit_path, output_dir, stem, label):
     for c in candidates:
         if c and os.path.exists(c):
             return c
+
     glob_patterns = [
         os.path.join(output_dir, f"best_model_{label}_*.safetensors"),
         os.path.join(output_dir, f"best_model_{label}_*.bin"),
@@ -134,11 +164,16 @@ def _resolve_checkpoint_path(explicit_path, output_dir, stem, label):
         hits = sorted(glob.glob(pat), key=os.path.getmtime, reverse=True)
         if hits:
             return hits[0]
+
     raise FileNotFoundError(
         f"[AUTO-CHECKPOINT] No checkpoint found for '{label}'. "
         f"Searched: {explicit_path} and glob patterns in {output_dir}."
     )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  INFERENCE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def inference(args):
     """Run Early Fusion inference loop and save generated images."""
@@ -165,7 +200,7 @@ def inference(args):
     )
 
     logger.info("=" * 60)
-    logger.info("START: INFERENCE")
+    logger.info("START: INFERENCE — Early Fusion branch")
     logger.info(f"timestamp           : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"GPU                 : {_n_gpus}  ({_gpu_info})")
     logger.info(f"base_model          : {args.pretrained_model_name_or_path}")
@@ -175,6 +210,8 @@ def inference(args):
     logger.info(f"guidance_scale      : {args.guidance_scale}")
     logger.info(f"uncond_mode         : {args.uncond_mode}")
     logger.info(f"prompt_template     : '{args.prompt}'")
+    logger.info(f"embeddings_dir      : {args.embeddings_dir}")
+    logger.info(f"embeddings_preload  : {args.embeddings_preload_all}")
     logger.info(f"learned_embeds      : {args.learned_embeds}")
     logger.info("=" * 60)
 
@@ -202,7 +239,6 @@ def inference(args):
         tokenizer = CLIPTokenizer.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="tokenizer"
         )
-    # and fed to the CLIP token embedding table inside MusicTokenWrapper.
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -210,6 +246,14 @@ def inference(args):
         torch.backends.cuda.matmul.allow_tf32 = True
 
     # ── Dataset ───────────────────────────────────────────────────────────────
+    # args.embeddings_dir, args.embeddings_preload_all and
+    # args.embeddings_max_sf_handles are passed through to Museart → LazyEmbeddingIndex.
+    logger.info(
+        f"LazyEmbeddingIndex will scan: {args.embeddings_dir}  "
+        f"[preload_all={args.embeddings_preload_all}, "
+        f"max_sf_handles={args.embeddings_max_sf_handles}]"
+    )
+
     test_dataset = Museart(
         args=args, tokenizer=tokenizer, logger=logger, size=args.resolution,
     )
@@ -231,7 +275,6 @@ def inference(args):
     model = MusicTokenWrapper(args).to(weight_dtype).eval().to(device)
     base_model = model
 
-
     # ── Scheduler (EulerDiscrete, v-prediction safe for SD 2.1) ───────────────
     from diffusers import EulerDiscreteScheduler
     scheduler = EulerDiscreteScheduler.from_pretrained(
@@ -245,14 +288,6 @@ def inference(args):
     )
 
     # ── Unconditional embedding for CFG ───────────────────────────────────────
-    #
-    # "zeros": uncond = zero vector of shape [1, 1, output_size].
-    #   Fast and clean; the audio+text signal is amplified directly.
-    #
-    # "text_only": uncond = EarlyFusionEncoder(silent_audio, text_tokens).
-    #   More semantically correct: CFG amplifies the *audio* contribution
-    #   above the text-only baseline, which mirrors how FuseLIP operates.
-
     output_size = base_model.unet.config.cross_attention_dim
     with torch.no_grad():
         if args.uncond_mode == "zeros":
@@ -262,8 +297,10 @@ def inference(args):
             logger.info("[CFG] uncond_mode=zeros: using zero vector.")
         else:
             # text_only: encode the prompt with silent (zero) audio features.
-            # This lets CFG amplify exactly the audio contribution.
-            _text_only_prompt = args.prompt.replace(args.placeholder_token, "").strip()
+            # CFG then amplifies exactly the audio contribution.
+            _text_only_prompt = args.prompt.replace(
+                args.placeholder_token, ""
+            ).strip()
             _uncond_ids = tokenizer(
                 [_text_only_prompt],
                 padding="max_length",
@@ -271,8 +308,8 @@ def inference(args):
                 truncation=True,
                 return_tensors="pt",
             ).input_ids.to(device)
-            # Determine audio temporal length from a dummy forward
-            _T_a = 376  # 30s × 16kHz / 160 / 8 (same as EarlyFusionEncoder default)
+            # 30 s × 16 kHz / 160 / 8 ≈ 376 frames (matches EarlyFusionEncoder default)
+            _T_a = 376
             _silent_audio = torch.zeros(
                 1, _T_a, 768 * 3, dtype=weight_dtype, device=device
             )
@@ -280,15 +317,14 @@ def inference(args):
             _uncond_fused = base_model.early_fusion(
                 audio_tokens=_silent_audio,
                 text_tokens=_text_tokens.to(weight_dtype),
-            )  # [1, output_size]
+            )
             uncond_embeddings = _uncond_fused.unsqueeze(1).to(dtype=weight_dtype)
-            # [1, 1, output_size]
             logger.info(
                 f"[CFG] uncond_mode=text_only: "
                 f"prompt='{_text_only_prompt}' + silent audio."
             )
 
-    # ── Tokenise the conditional prompt (constant across images) ─────────────
+    # ── Tokenise the conditional prompt (constant across all images) ──────────
     cond_input_ids = tokenizer(
         [args.prompt],
         padding="max_length",
@@ -312,21 +348,18 @@ def inference(args):
 
         with torch.no_grad():
             # ── Conditional embedding (audio + text fused) ────────────────────
-            # It internally: projects audio + text → shared Transformer → pool →
-            # output_proj → [B, output_size].
             audio_feats = aud_features.to(weight_dtype)
             text_tokens = base_model._get_text_embeddings(cond_input_ids).to(weight_dtype)
-            
+
             cond_fused = base_model.early_fusion(
                 audio_tokens=audio_feats,
                 text_tokens=text_tokens,
-                )  # [1, output_size]
+            )  # [1, output_size]
             cond_embeddings = cond_fused.unsqueeze(1).to(dtype=weight_dtype)
             # [1, 1, output_size]
 
-            # CFG: stack uncond + cond
+            # CFG: stack uncond + cond → [2, 1, output_size]
             text_embeddings = torch.cat([uncond_embeddings, cond_embeddings])
-            # [2, 1, output_size]
 
             # ── Latent diffusion ──────────────────────────────────────────────
             seed = random.randint(0, 10000)
@@ -360,13 +393,13 @@ def inference(args):
             _sf = base_model.vae.config.scaling_factor  # 0.18215 for SD 2.1
             latents = latents / _sf
             base_model.vae.to(dtype=torch.float32)
-            latents_f32 = latents.to(base_model.vae.device).float()
-            image_tensor = base_model.vae.decode(latents_f32).sample
+            latents_f32    = latents.to(base_model.vae.device).float()
+            image_tensor   = base_model.vae.decode(latents_f32).sample
             base_model.vae.to(dtype=weight_dtype)
 
             image_tensor = (image_tensor / 2 + 0.5).clamp(0, 1)
             image_tensor = image_tensor.cpu().permute(0, 2, 3, 1).float().numpy()
-            image_np = (image_tensor[0] * 255).round().astype("uint8")
+            image_np     = (image_tensor[0] * 255).round().astype("uint8")
 
         from PIL import Image
         image = Image.fromarray(image_np)
