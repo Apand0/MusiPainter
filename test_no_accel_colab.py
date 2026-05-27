@@ -30,6 +30,7 @@ check_min_version("0.12.0")
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+#  ARG PARSING
 
 def parse_args():
     """Parse command-line arguments."""
@@ -42,6 +43,10 @@ def parse_args():
             return False
         raise argparse.ArgumentTypeError(f"Valore booleano atteso, ricevuto: '{v}'")
     parser = argparse.ArgumentParser(description="Testing script con pre-encoded embeddings")
+
+    from modules.preprocess.argparse_multiembedding_patch import add_multiembedding_args
+    add_multiembedding_args(parser)
+
     parser.add_argument("--learned_embeds", type=str, 
                         default='./output/learned_embeds.safetensors')
     parser.add_argument("--learned_vae", type=str, 

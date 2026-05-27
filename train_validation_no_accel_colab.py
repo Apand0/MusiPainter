@@ -167,7 +167,7 @@ def save_progress(module, save_path):
     state = _unwrap_compiled(module).state_dict()
     if str(save_path).endswith('.safetensors'):
         # Preferred format: no pickle, safe for distribution.
-        from utils import save_safetensors
+        from modules.preprocess.utils import save_safetensors
         save_safetensors(state, save_path)
     else:
         # Legacy path — backward compat with existing .bin checkpoints.
@@ -265,7 +265,7 @@ def load_embedder_weights(weight_path, embedder, device, resume_step: int = 0):
     logger.info(f"[RESUME-WEIGHTS] Loading embedder weights from: {resolved}")
 
     if resolved.endswith(".safetensors"):
-        from utils import load_safetensors
+        from modules.preprocess.utils import load_safetensors
         state_dict = load_safetensors(resolved, device=str(device))
     else:
         state_dict = torch.load(resolved, map_location=device, weights_only=True)
@@ -440,6 +440,10 @@ def parse_args():
         raise argparse.ArgumentTypeError(f"Valore booleano atteso, ricevuto: '{v}'")
 
     parser = argparse.ArgumentParser()
+
+    from modules.preprocess.argparse_multiembedding_patch import add_multiembedding_args
+    add_multiembedding_args(parser)
+
     parser.add_argument("--save_steps", type=int, default=2500)
     parser.add_argument("--pretrained_model_name_or_path", type=str,
                         default='stabilityai/stable-diffusion-2')
@@ -1222,7 +1226,7 @@ def train_validation():
                         _new_best = os.path.join(args.output_dir, f'best_model_embedder_{timestamp}.safetensors')
                         _new_best_tmp = _new_best + ".tmp"
                         # Save best embedder in safetensors format (pickle-free).
-                        from utils import save_safetensors as _sf_save
+                        from modules.preprocess.utils import save_safetensors as _sf_save
                         _sf_save(_unwrap_compiled(base_model.embedder).state_dict(), _new_best_tmp)
                         if best_model_path is not None and os.path.exists(best_model_path) and best_model_path != _new_best:
                             os.remove(best_model_path)
@@ -1343,7 +1347,7 @@ def train_validation():
                     )
                     new_best_path_tmp = new_best_path + ".tmp"
                     # Save best embedder weights in safetensors format (pickle-free).
-                    from utils import save_safetensors as _sf_save_ep
+                    from modules.preprocess.utils import save_safetensors as _sf_save_ep
                     _sf_save_ep(_unwrap_compiled(base_model.embedder).state_dict(), new_best_path_tmp)
                     if best_model_path is not None and os.path.exists(best_model_path) and best_model_path != new_best_path:
                         os.remove(best_model_path)

@@ -618,6 +618,130 @@ extracted from the source files.
 
 
 # =============================================================================
+# preprocess_manager.py
+# =============================================================================
+
+[KAGGLE-DISK]
+  Monitors free disk space before every class batch. Stops
+  automatically when free space falls below --critical_free_gb (default 2.0 GB),
+  preventing data loss from a full disk. Prints step-by-step instructions for
+  uploading the partial output as a new Kaggle Dataset and resuming with
+  --existing_datasets on the next kernel run.
+
+[KAGGLE-CLASS-BATCH]
+  Processes audio classes in batches of size --class_batch_size (default 5).
+  Between batches, disk space is checked and gc.collect() is triggered. This
+  gives finer-grained control than processing all classes at once, which could
+  exceed the 20 GB quota mid-run without a clean stopping point.
+
+[KAGGLE-STRIDE-SWEEP]
+  Supports encoding at multiple temporal_pool_stride values in a single session
+  via --strides. Each stride gets its own output subdirectory (stride<N>/), so
+  multiple compression levels can be precomputed before uploading. After all
+  strides complete (or disk runs out), the user uploads the results and re-runs
+  with --existing_datasets to continue any unfinished strides.
+
+[KAGGLE-RESUME]
+  The --existing_datasets flag accepts comma-separated paths to read-only Kaggle
+  Dataset directories containing chunks from previous runs. Already-encoded audio
+  IDs are skipped automatically, enabling incremental preprocessing across
+  multiple kernel sessions without reprocessing.
+
+[KAGGLE-SKIP-MERGE]
+  --skip_merge prevents the final streaming merge into a single safetensors file.
+  On Kaggle this saves ~largest_chunk of extra disk space. The dataloader reads
+  per-class chunks in chunks/ directly, so training is unaffected.
+
+[KAGGLE-INSTRUCTIONS]
+  When disk runs low, _print_upload_instructions() generates a complete resume
+  command with all flags pre-filled, including the new dataset path. The user
+  only needs to copy-paste and re-run.
+
+
+# =============================================================================
+# argparse_multiembedding.py
+# =============================================================================
+
+[MULTIEMB-ARGS]
+  add_multiembedding_args(parser) registers three new CLI flags:
+    --embeddings_dir            : comma-separated paths to embedding directories
+    --embeddings_preload_all    : bool, True = RAM preload, False = lazy mmap
+    --embeddings_max_sf_handles : int, LRU cache size for open file handles
+  Safe to call multiple times (uses conflict_handler='resolve' internally).
+
+[MULTIEMB-INDEX]
+  build_embedding_index(args, logger) constructs a LazyEmbeddingIndex from the
+  parsed args. Returns None when args.embeddings_dir is falsy. The Museart Dataset
+  class reads args.embeddings_dir, args.embeddings_preload_all, and
+  args.embeddings_max_sf_handles directly, so explicit construction is optional.
+
+[MULTIEMB-BOOL]
+  _str2bool() accepts 'yes/true/1' and 'no/false/0' for flexible boolean parsing
+  from CLI strings.
+
+
+# =============================================================================
+# dataloader_colab.py  (additional functional notes)
+# =============================================================================
+
+[LAZY-EMB-MULTI]
+  LazyEmbeddingIndex._build_index() scans each directory independently and merges
+  audio IDs into a single in-memory index. Duplicate IDs across directories are
+  resolved with last-write-wins semantics. The index stores either True (tensor
+  in _flat_cache for preload_all=True) or an absolute file path string (for
+  preload_all=False lazy mmap).
+
+[LAZY-EMB-LRU]
+  In lazy mode, _get_from_sf() maintains an LRU cache of open safetensors file
+  handles capped at max_sf_handles. When the cache is full, the oldest handle is
+  evicted via pop() before opening the new file. Accessing an existing handle
+  moves it to the most-recently-used position.
+
+[LAZY-EMB-LEGACY]
+  _index_legacy_pt() provides backward compatibility for .pt chunk files. When
+  preload_all=True, tensors are loaded into _flat_cache immediately. When False,
+  only the file path is stored and an LRU cache of loaded chunk dicts (max 4)
+  is maintained by _get_from_pt().
+
+[LAZY-LATENT-SF]
+  LazyLatentIndex._build_index() prefers a single merged image_latents.safetensors
+  file. If absent, it falls back to legacy image_latents_*.pt chunks. In preload
+  mode all tensors are copied to _flat_cache and the safe_open handle is released.
+  In lazy mode the handle is kept open for mmap access.
+
+[LAZY-LATENT-LRU]
+  For legacy .pt chunks, LazyLatentIndex uses the same LRU pattern as
+  LazyEmbeddingIndex: a max_cached_chunks=4 cache of loaded chunk dictionaries.
+
+[MUSEART-PREPARE]
+  prepare_dataset() builds three parallel lists (audio_path, image_path, label)
+  by joining the audio CSV against the image CSV on the 'class' column. Image IDs
+  are matched via set_index('id') for O(1) lookup and groupby('class') for per-class
+  candidate pools. Missing images trigger a filesystem search with both underscore
+  and dash filename variants.
+
+[MUSEART-RETRY]
+  __getitem__ implements up to num_samples retry attempts when an image or latent
+  is missing. This prevents a single missing file from crashing the DataLoader
+  worker process. The retry uses modulo indexing to wrap around the dataset.
+
+[MUSEART-TXT-CACHE]
+  All template strings are tokenised once in __init__ and stored as contiguous
+  tensors in _cached_input_ids. txt_proc() selects one via random.randrange,
+  avoiding per-sample tokenisation overhead (~0.5 ms/call).
+
+[MUSEART-AUD-EMB]
+  aud_proc_beats() resolves the audio embedding via LazyEmbeddingIndex.get() when
+  available, otherwise falls back to a dict lookup. All returned tensors are
+  squeezed (if dim==3) and made contiguous before returning to the collate function.
+
+[MUSEART-IMG-LATENT]
+  When image_latents is configured, __getitem__ bypasses img_proc() and VAE
+  encoding entirely, reading precomputed float16 latents from disk. This cuts
+  per-batch CPU time by ~60% during training and inference.
+
+
+# =============================================================================
 # safetensors weight format migration  (2026-05-19)
 # =============================================================================
 
