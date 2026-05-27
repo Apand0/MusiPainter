@@ -513,7 +513,7 @@ and [EARLY-FUSION-*] annotations extracted from the source files.
 
 
 # =============================================================================
-# safetensors weight format migration  (2026-05-19)
+# safetensors weight format migration
 # =============================================================================
 
 [FMT-SAFETENSORS]

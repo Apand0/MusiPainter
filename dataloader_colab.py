@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
-        "linear":  PIL.Image.Resampling.BILINEAR,
+        "linear":   PIL.Image.Resampling.BILINEAR,
         "bilinear": PIL.Image.Resampling.BILINEAR,
         "bicubic":  PIL.Image.Resampling.BICUBIC,
         "lanczos":  PIL.Image.Resampling.LANCZOS,
@@ -41,7 +41,7 @@ if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("
     }
 else:
     PIL_INTERPOLATION = {
-        "linear":  PIL.Image.LINEAR,
+        "linear":   PIL.Image.LINEAR,
         "bilinear": PIL.Image.BILINEAR,
         "bicubic":  PIL.Image.BICUBIC,
         "lanczos":  PIL.Image.LANCZOS,
@@ -72,8 +72,8 @@ class LazyEmbeddingIndex:
     def __init__(
         self,
         embeddings_dirs: str,
-        preload_all:      bool = True,
-        max_sf_handles:   int  = 8,
+        preload_all:     bool = True,
+        max_sf_handles:  int  = 8,
     ):
         raw_dirs = [d.strip() for d in str(embeddings_dirs).split(",") if d.strip()]
         self._dirs: list[Path] = [Path(d) for d in raw_dirs]
@@ -105,9 +105,9 @@ class LazyEmbeddingIndex:
                 + "\n".join(f"  {d}" for d in sorted(missing))
             )
         self._dirs = valid_dirs
-
         self._build_index()
 
+    # ──────────────────────────────────────────────────────────────────────────
     def _build_index(self) -> None:
         mode_label = "preload RAM" if self._preload_all else "lazy mmap"
         logger.info(
@@ -213,7 +213,7 @@ class LazyEmbeddingIndex:
         return files
 
     def _index_legacy_pt(self, d: Path, sample_shape: list | None) -> None:
-        """Index legacy torch.save .pt chunks from *d* (backward compat)."""
+        """Index legacy torch.save .pt chunks from *d* (backward compatibility)."""
         legacy_files = sorted(d.glob("audio_embeddings_*.pt"))
         if not legacy_files:
             return
@@ -500,8 +500,11 @@ class Museart(Dataset):
         self.audio_path: list = []
         self.label:      list = []
 
-        self.center_crop = args.center_crop if self.data_set in ('train', 'validation')             else False
+        self.center_crop = (
+            args.center_crop if self.data_set in ('train', 'validation') else False
+        )
 
+        # Walk directories once at init with followlinks=True
         self.audio_id_to_path = {}
         for root, dirs, files in os.walk(self.audio_root_dir, followlinks=True):
             for f in files:
@@ -525,7 +528,7 @@ class Museart(Dataset):
         logger.info(f"{self.data_set}: {self.num_samples} samples")
 
         self.interpolation = {
-            "linear":  PIL_INTERPOLATION["linear"],
+            "linear":   PIL_INTERPOLATION["linear"],
             "bilinear": PIL_INTERPOLATION["bilinear"],
             "bicubic":  PIL_INTERPOLATION["bicubic"],
             "lanczos":  PIL_INTERPOLATION["lanczos"],

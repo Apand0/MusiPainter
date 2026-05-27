@@ -134,7 +134,6 @@ def save_progress(module, save_path):
     logger.info(f"Saving weights to {save_path}")
     state = _unwrap_compiled(module).state_dict()
     if str(save_path).endswith('.safetensors'):
-        # Preferred format: no pickle, safe for distribution.
         from modules.preprocess.utils import save_safetensors
         save_safetensors(state, save_path)
     else:
@@ -1172,11 +1171,14 @@ def train_validation():
                         args.output_dir,
                         f'best_model_early_fusion_{timestamp}.safetensors'
                     )
-                    new_best_path_tmp = new_best_path + ".tmp"
-                    # Save best embedder weights in safetensors format (pickle-free).
+                    _nb_tmp = _nb + ".tmp"
                     from modules.preprocess.utils import save_safetensors as _sf_save_ep
-                    _sf_save_ep(_unwrap_compiled(base_model.embedder).state_dict(), new_best_path_tmp)
-                    if best_model_path is not None and os.path.exists(best_model_path) and best_model_path != new_best_path:
+                    _sf_save_ep(
+                        _unwrap_compiled(base_model.early_fusion).state_dict(),
+                        _nb_tmp
+                    )
+                    if best_model_path and os.path.exists(best_model_path) \
+                            and best_model_path != _nb:
                         os.remove(best_model_path)
                     os.replace(_nb_tmp, _nb)
                     if args.lora:
