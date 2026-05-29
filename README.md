@@ -1,5 +1,5 @@
 # MusiPainter
-Thesis Project that follow the model Musipainter to create image based on audio track and artistic motif
+Thesis Project that follows the model Musipainter to create image based on audio track and artistic motif
 
 Executed by actual modules:
 - BEATs Model: https://huggingface.co/camenduru/beats/resolve/main/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt
