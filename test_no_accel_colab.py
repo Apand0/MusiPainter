@@ -55,7 +55,7 @@ def parse_args():
         raise argparse.ArgumentTypeError(f"Valore booleano atteso, ricevuto: '{v}'")
     parser = argparse.ArgumentParser(description="Testing script con pre-encoded embeddings")
 
-    from modules.preprocess.argparse_multiembedding_patch import add_multiembedding_args
+    from modules.preprocess.argparse_multiembedding import add_multiembedding_args
     add_multiembedding_args(parser)
 
     parser.add_argument("--learned_embeds", type=str, 
@@ -295,16 +295,34 @@ def inference(args):
     output_size = base_model.unet.config.cross_attention_dim
     with torch.no_grad():
         if args.uncond_mode == "zeros":
-            uncond_embeddings = torch.zeros(
-                1, 1, output_size, dtype=weight_dtype, device=device
+            # [EARLY-FUSION-SEQ] Per la modalità zeros dobbiamo comunque produrre
+            # una sequenza della stessa lunghezza del conditioning condizionato.
+            # Usiamo audio+text silenziosi per ottenere la forma corretta.
+            _T_t = tokenizer.model_max_length   # 77
+            _T_a = 94   # stride=4 default; adatta se usi stride diverso
+
+            # Sequenza zero: il modello la vede durante training con CFG dropout,
+            # quindi sa cosa significa 'nessun conditioning'.
+            uncond_audio = torch.zeros(1, _T_a, 768 * 3, dtype=weight_dtype, device=device)
+            uncond_ids   = tokenizer(
+                [""],
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            ).input_ids.to(device)
+            uncond_text = base_model._get_text_embeddings(uncond_ids).to(weight_dtype)
+            uncond_embeddings = base_model.early_fusion(
+                audio_tokens=uncond_audio,
+                text_tokens=uncond_text,
+            )   # [1, T_a+T_t, output_size]
+            logger.info(
+                f"[CFG] uncond_mode=zeros: "
+                f"shape={list(uncond_embeddings.shape)}"
             )
-            logger.info("[CFG] uncond_mode=zeros: using zero vector.")
-        else:
-            # text_only: encode the prompt with silent (zero) audio features.
-            # CFG then amplifies exactly the audio contribution.
-            _text_only_prompt = args.prompt.replace(
-                args.placeholder_token, ""
-            ).strip()
+
+        else:   # text_only
+            _text_only_prompt = args.prompt.replace(args.placeholder_token, '').strip()
             _uncond_ids = tokenizer(
                 [_text_only_prompt],
                 padding="max_length",
@@ -312,21 +330,21 @@ def inference(args):
                 truncation=True,
                 return_tensors="pt",
             ).input_ids.to(device)
-            # 30 s × 16 kHz / 160 / 8 ≈ 376 frames (matches EarlyFusionEncoder default)
-            _T_a = 376
-            _silent_audio = torch.zeros(
-                1, _T_a, 768 * 3, dtype=weight_dtype, device=device
-            )
-            _text_tokens = base_model._get_text_embeddings(_uncond_ids)
-            _uncond_fused = base_model.early_fusion(
+            _T_a = 94   # stride=4 default; adatta se usi stride diverso
+            _silent_audio = torch.zeros(1, _T_a, 768 * 3, dtype=weight_dtype, device=device)
+            _text_tokens  = base_model._get_text_embeddings(_uncond_ids).to(weight_dtype)
+            uncond_embeddings = base_model.early_fusion(
                 audio_tokens=_silent_audio,
-                text_tokens=_text_tokens.to(weight_dtype),
-            )
-            uncond_embeddings = _uncond_fused.unsqueeze(1).to(dtype=weight_dtype)
+                text_tokens=_text_tokens,
+            )   # [1, T_a+T_t, output_size]
             logger.info(
                 f"[CFG] uncond_mode=text_only: "
-                f"prompt='{_text_only_prompt}' + silent audio."
+                f"prompt='{_text_only_prompt}', shape={list(uncond_embeddings.shape)}"
             )
+
+    # NOTA: _T_a deve corrispondere allo stride usato nel preprocessing.
+    # stride=4 → T_a≈94, stride=8 → T_a≈47.
+    # Puoi aggiungere --uncond_T_a come argomento CLI per renderlo configurabile.
 
     # ── Tokenise the conditional prompt (constant across all images) ──────────
     cond_input_ids = tokenizer(
@@ -355,14 +373,14 @@ def inference(args):
             audio_feats = aud_features.to(weight_dtype)
             text_tokens = base_model._get_text_embeddings(cond_input_ids).to(weight_dtype)
 
-            cond_fused = base_model.early_fusion(
+            # [EARLY-FUSION-SEQ] cond_embeddings è già [1, T_a+T_t, output_size].
+            # Non serve unsqueeze(1).
+            cond_embeddings = base_model.early_fusion(
                 audio_tokens=audio_feats,
                 text_tokens=text_tokens,
-            )  # [1, output_size]
-            cond_embeddings = cond_fused.unsqueeze(1).to(dtype=weight_dtype)
-            # [1, 1, output_size]
+            )   # [1, T_a+T_t, output_size]
 
-            # CFG: stack uncond + cond → [2, 1, output_size]
+            # CFG: stack uncond + cond sulla dimensione batch → [2, T_a+T_t, output_size]
             text_embeddings = torch.cat([uncond_embeddings, cond_embeddings])
 
             # ── Latent diffusion ──────────────────────────────────────────────

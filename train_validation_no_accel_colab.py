@@ -366,7 +366,7 @@ def parse_args():
 
     parser = argparse.ArgumentParser()
 
-    from modules.preprocess.argparse_multiembedding_patch import add_multiembedding_args
+    from modules.preprocess.argparse_multiembedding import add_multiembedding_args
     add_multiembedding_args(parser)
 
     parser.add_argument("--save_steps", type=int, default=2500)
@@ -849,18 +849,19 @@ def train_validation():
                         (bv,), device=device,
                     ).long()
                     nl  = noise_scheduler.add_noise(lats, nv, tv)
-                    mp, at = model(af, iids, nl, tv)
+                    mp, fused_seq = model(af, iids, nl, tv)
+                    fused_pooled  = fused_seq.mean(dim=1)   # [B, output_size] per le loss
+
                     tgt = (
                         nv if _prediction_type == "epsilon"
                         else noise_scheduler.get_velocity(lats, nv, tv).float()
                     )
                     lv = F.mse_loss(mp, tgt, reduction="mean")
-                    _reg = args.lambda_a * torch.mean(torch.abs(at))
+                    _reg = args.lambda_a * torch.mean(torch.abs(fused_pooled))
                     if args.lambda_b > 0:
-                        _reg = _reg + args.lambda_b * (
-                            torch.norm(at, p=2, dim=1) ** 2
-                        ).mean()
+                        _reg = _reg + args.lambda_b * (torch.norm(fused_pooled, p=2, dim=1) ** 2).mean()
                     lv = lv + _reg
+
                     if args.cosine_loss and _label_to_idx is not None:
                         lbs     = vb['label']
                         ridxs   = [_label_to_idx[l] for l in lbs if l in _label_to_idx]
@@ -868,7 +869,7 @@ def train_validation():
                         if ridxs:
                             idx_t = torch.tensor(ridxs, device=device)
                             ct    = _label_matrix.index_select(0, idx_t)
-                            ae    = at[aidxs]
+                            ae    = fused_pooled[aidxs]
                             em_n  = F.normalize(ae.float(), dim=1)
                             ct_n  = F.normalize(ct.float(), dim=1)
                             cs    = (em_n * ct_n).sum(dim=1).mean()
@@ -925,6 +926,17 @@ def train_validation():
             audio_features = batch["audio_features"]
             input_ids      = batch["input_ids"]
 
+            # [CFG-DROPOUT] Con probabilità cfg_dropout_prob azzera il conditioning
+            # audio o testo in modo casuale. Questo insegna al modello a generare
+            # anche senza conditioning, rendendo il CFG in inferenza efficace.
+            # Senza questo step, il guidance_scale in test produce immagini OOD.
+            CFG_DROPOUT_PROB = 0.10   # 10% dei batch ricevono conditioning azzerato
+
+            if torch.rand(1).item() < CFG_DROPOUT_PROB:
+                # Azzera tutto il conditioning (unconditional step)
+                audio_features = torch.zeros_like(audio_features)
+                input_ids = torch.full_like(input_ids, tokenizer.pad_token_id or 0)
+
             with autocast(enabled=use_amp):
                 is_pre = batch.get("is_precomputed_latent", None)
                 if is_pre is not None and bool(is_pre.all()):
@@ -963,34 +975,32 @@ def train_validation():
                 else:
                     raise ValueError(f"Unknown prediction type: {_prediction_type}")
 
-                model_pred, fused_embed = model(
+                model_pred, fused_seq = model(
                     audio_features, input_ids, noisy_latents, timesteps,
                 )
 
+                # [EARLY-FUSION-SEQ] Pool solo per le loss ausiliarie.
+                # Il UNet ha già ricevuto la sequenza completa all'interno di forward().
+                fused_pooled = fused_seq.mean(dim=1)   # [B, output_size]
+
                 loss = F.mse_loss(model_pred, target, reduction="mean")
 
-                _reg = args.lambda_a * torch.mean(torch.abs(fused_embed))
+                # Regularisation: penalizza valori assoluti grandi nel vettore medio
+                _reg = args.lambda_a * torch.mean(torch.abs(fused_pooled))
                 if args.lambda_b > 0:
-                    _reg = _reg + args.lambda_b * (
-                        torch.norm(fused_embed, p=2, dim=1) ** 2
-                    ).mean()
+                    _reg = _reg + args.lambda_b * (torch.norm(fused_pooled, p=2, dim=1) ** 2).mean()
                 loss = loss + _reg
 
+                # Cosine loss: allinea il vettore medio fuso con l'embedding del label CLIP
                 if args.cosine_loss and _label_to_idx is not None:
                     labels   = batch['label']
-                    row_idxs = [
-                        _label_to_idx[lbl] for lbl in labels
-                        if lbl in _label_to_idx
-                    ]
-                    aud_idxs = [
-                        j for j, lbl in enumerate(labels)
-                        if lbl in _label_to_idx
-                    ]
+                    row_idxs = [_label_to_idx[lbl] for lbl in labels if lbl in _label_to_idx]
+                    aud_idxs = [j for j, lbl in enumerate(labels) if lbl in _label_to_idx]
                     if row_idxs:
                         idx_t     = torch.tensor(row_idxs, dtype=torch.long, device=device)
                         aud_idx_t = torch.tensor(aud_idxs, dtype=torch.long, device=device)
                         ct        = _label_matrix.index_select(0, idx_t)
-                        at        = fused_embed.index_select(0, aud_idx_t)
+                        at        = fused_pooled.index_select(0, aud_idx_t)
                         em_n      = F.normalize(at.float(), dim=1)
                         ct_n      = F.normalize(ct.float(), dim=1)
                         cs        = (em_n * ct_n).sum(dim=1).mean()

@@ -4,8 +4,12 @@ MusicToken_no_accel.py — Core model wrapper for the Musipainter pipeline.
 
 Wraps VAE, UNet, frozen CLIP token embeddings, BEATs audio encoder and the
 trainable EarlyFusionEncoder into a single nn.Module for training and inference.
-Only EarlyFusionEncoder (and optionally LoRA layers) has requires_grad=True.
-All other components are frozen in float16 to save VRAM.
+
+[EARLY-FUSION-SEQ] The EarlyFusionEncoder now returns a full sequence
+[B, T_a+T_t, output_size] instead of a single pooled vector [B, output_size].
+This sequence is passed directly as encoder_hidden_states to the UNet so that
+its cross-attention layers can attend to different fused tokens for different
+spatial regions of the generated image — matching the original LDM design.
 """
 
 import gc
@@ -27,10 +31,9 @@ def _load_weights(path, map_device) -> dict:
     Load model weights from a .safetensors or legacy .bin/.pt file.
 
     Resolution order:
-      1. If *path* ends with '.safetensors' → use load_safetensors (pickle-free).
+      1. .safetensors path → load_safetensors (pickle-free).
       2. Otherwise → torch.load (legacy .bin or .pt checkpoint).
-    If the exact path does not exist and a .bin was requested, tries the
-    corresponding .safetensors path before raising FileNotFoundError.
+    Auto-switches from .bin to .safetensors when .bin is not found.
     """
     import os
     resolved = str(path)
@@ -38,9 +41,7 @@ def _load_weights(path, map_device) -> dict:
     if not os.path.exists(resolved) and resolved.endswith(".bin"):
         sf_candidate = resolved[:-4] + ".safetensors"
         if os.path.exists(sf_candidate):
-            logger.info(
-                f"[_load_weights] .bin not found, auto-switching to: {sf_candidate}"
-            )
+            logger.info(f"[_load_weights] .bin not found, auto-switching to: {sf_candidate}")
             resolved = sf_candidate
 
     if not os.path.exists(resolved):
@@ -60,6 +61,10 @@ class MusicTokenWrapper(nn.Module):
 
     Only EarlyFusionEncoder (and optionally LoRA layers) has requires_grad=True.
     All other components are frozen in float16 to save VRAM.
+
+    [EARLY-FUSION-SEQ] forward() now receives fused_seq [B, T, output_size]
+    from EarlyFusionEncoder and passes it directly to the UNet without
+    collapsing the sequence dimension.
     """
 
     def __init__(self, args):
@@ -129,15 +134,15 @@ class MusicTokenWrapper(nn.Module):
         # ── Dimensions ────────────────────────────────────────────────────────
         audio_dim   = 768 * 3
         output_size = self.unet.config.cross_attention_dim
-        # Legge i parametri FuseLIP dagli argomenti CLI
-        d_model     = getattr(args, 'ef_d_model', 512)
-        nhead       = getattr(args, 'ef_nhead', 8)
-        num_layers  = getattr(args, 'ef_num_layers', 12)
-        dropout     = getattr(args, 'ef_dropout', 0.1)
+        d_model     = getattr(args, 'ef_d_model',    512)
+        nhead       = getattr(args, 'ef_nhead',        8)
+        num_layers  = getattr(args, 'ef_num_layers',   4)
+        dropout     = getattr(args, 'ef_dropout',    0.1)
 
         logger.info(
             f"EarlyFusionEncoder: audio_dim={audio_dim}, text_dim={self._text_dim}, "
-            f"output_size={output_size}, d_model={d_model}, nhead={nhead}"
+            f"output_size={output_size}, d_model={d_model}, nhead={nhead}, "
+            f"num_layers={num_layers}"
         )
 
         # ── Trainable EarlyFusionEncoder ──────────────────────────────────────
@@ -150,8 +155,7 @@ class MusicTokenWrapper(nn.Module):
             num_layers=num_layers,
             dropout=dropout,
         )
-        # Alias kept so checkpoint helpers (save_progress, _unwrap_compiled)
-        # in the training script work without modification.
+        # Alias kept for checkpoint helpers compatibility.
         self.embedder = self.early_fusion
 
         # ── Eval mode for frozen components ───────────────────────────────────
@@ -226,10 +230,7 @@ class MusicTokenWrapper(nn.Module):
             if hasattr(args, 'lora') and args.lora:
                 self.lora_layers.requires_grad_(True)
                 self.lora_layers.train()
-                logger.info(
-                    "lora_layers.train() — "
-                    "UNet backbone remains frozen/eval."
-                )
+                logger.info("lora_layers.train() — UNet backbone remains frozen/eval.")
 
         elif args.data_set == 'test':
             map_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -249,25 +250,15 @@ class MusicTokenWrapper(nn.Module):
                 self.unet.load_state_dict(_load_weights(args.learned_unet, map_device))
             if hasattr(args, 'lora') and args.lora:
                 if self.lora_layers is None:
-                    raise RuntimeError(
-                        "lora_layers is None but --lora=True."
-                    )
+                    raise RuntimeError("lora_layers is None but --lora=True.")
                 _lora_state = _load_weights(args.learned_embeds_lora, map_device)
                 self.lora_layers.load_state_dict(_lora_state)
                 self.lora_layers.eval()
-                logger.info(
-                    f"LoRA weights loaded from: {args.learned_embeds_lora}"
-                )
+                logger.info(f"LoRA weights loaded from: {args.learned_embeds_lora}")
 
     # ──────────────────────────────────────────────────────────────────────────
     def set_placeholder_token_id(self, token_id: int):
-        """
-        No-op kept for CLI backward-compatibility.
-
-        Placeholder injection into CLIP is not used in the Early Fusion
-        architecture.  The token embedding table is queried directly for all
-        text tokens; fusion is handled by EarlyFusionEncoder.
-        """
+        """No-op kept for CLI backward-compatibility."""
         pass
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -294,30 +285,42 @@ class MusicTokenWrapper(nn.Module):
         timesteps:      torch.Tensor,
     ):
         """
+        Forward pass.
+
         Args:
-            audio_features : [B, T_a, 2304]    float32  — BEATs concat(4,8,12)
-            input_ids      : [B, seq_len]       long     — CLIP token IDs
+            audio_features : [B, T_a, 2304]    float32
+                             T_a depends on temporal_pool_stride used at
+                             preprocessing (stride=4 → T_a≈94, stride=8 → T_a≈47).
+            input_ids      : [B, seq_len]       long
             noisy_latents  : [B, 4, H/8, W/8]  float16
             timesteps      : [B]                long
 
         Returns:
-            model_pred  : [B, 4, H/8, W/8] float32
-            fused_embed : [B, output_size]  float32
+            model_pred : [B, 4, H/8, W/8] float32
+            fused_seq  : [B, T_a+T_t, output_size] float32
+                         Full fused sequence (used by training loop for aux losses).
         """
-        text_tokens = self._get_text_embeddings(input_ids)
+        text_tokens = self._get_text_embeddings(input_ids)  # [B, T_t, text_dim]
 
         audio_feats = (
             audio_features.float()
             if audio_features.dtype != torch.float32
             else audio_features
         )
-        fused_embed = self.early_fusion(
+
+        # [EARLY-FUSION-SEQ] EarlyFusionEncoder now returns the full sequence
+        # [B, T_a+T_t, output_size] instead of a single pooled vector.
+        fused_seq = self.early_fusion(
             audio_tokens=audio_feats,
             text_tokens=text_tokens,
-        )  # [B, output_size]
+        )   # [B, T_a+T_t, output_size]
 
-        encoder_hidden_states = fused_embed.unsqueeze(1).to(dtype=noisy_latents.dtype)
-        # [B, 1, output_size]
+        # [EARLY-FUSION-SEQ] Pass the full sequence directly as
+        # encoder_hidden_states. No .unsqueeze(1) needed: the sequence
+        # dimension is already T_a+T_t, giving the UNet cross-attention
+        # meaningful K and V to attend to.
+        encoder_hidden_states = fused_seq.to(dtype=noisy_latents.dtype)
+        # [B, T_a+T_t, output_size]
 
         model_pred = self.unet(
             noisy_latents if noisy_latents.dtype == torch.float16
@@ -326,4 +329,4 @@ class MusicTokenWrapper(nn.Module):
             encoder_hidden_states,
         ).sample.float()
 
-        return model_pred, fused_embed
+        return model_pred, fused_seq
