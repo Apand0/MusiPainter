@@ -221,8 +221,12 @@ def build_label_embedding_cache(tokenizer, token_embedding, all_labels, device):
     """
     Pre-compute cosine-loss target vectors for each unique art style label.
 
-    Uses base_model.token_embedding (frozen CLIP nn.Embedding) directly;
-    semantics: mean of CLIP token embeddings for label words (excluding BOS/EOS).
+    Uses base_model.token_embedding (frozen CLIP nn.Embedding) directly.
+    Semantics: mean of CLIP token embeddings for label words (excluding BOS/EOS),
+    then L2-normalised to produce l̂ as per Musipainter eq. (2/5).
+
+    Pre-normalising here avoids redundant normalisation on every training step
+    and ensures the stored matrix already satisfies ‖l̂‖ = 1.
     """
     label_list = sorted(set(all_labels))
     vecs = []
@@ -234,6 +238,8 @@ def build_label_embedding_cache(tokenizer, token_embedding, all_labels, device):
         ids_t = torch.tensor(ids, device=device)
         with torch.no_grad():
             vec = token_embedding(ids_t).float().mean(dim=0).detach()
+            # [MUSIPAINTER-EQ2/5] Pre-normalise l̂ as in the paper
+            vec = F.normalize(vec.unsqueeze(0), dim=1).squeeze(0)
         vecs.append(vec)
         valid_labels.append(label)
 
@@ -260,6 +266,7 @@ def precompute_vae_latents(vae, dataloader, device, use_amp):
             pixel_values = batch["pixel_values"].to(device, non_blocking=True)
             image_ids    = batch["image_id"]
             with autocast(enabled=use_amp):
+                # LDM Sec. 3.1: z = E(x) * scaling_factor
                 latents = vae.encode(
                     pixel_values.to(dtype=torch.float16)
                 ).latent_dist.sample() * 0.18215
@@ -433,6 +440,15 @@ def parse_args():
                         help="EarlyFusionEncoder number of Transformer layers.")
     parser.add_argument("--ef_dropout", type=float, default=0.1,
                         help="EarlyFusionEncoder dropout rate.")
+    # [AUDIO-RESAMPLER v10] new args — Audio Resampler
+    parser.add_argument("--ef_n_audio_queries", type=int, default=32,
+                        help="N_q: number of audio summary tokens produced by the "
+                             "AudioResampler. Output sequence to UNet = N_q + 1 + T_t ")
+    parser.add_argument("--ef_resampler_heads", type=int, default=8,
+                        help="Number of attention heads in the AudioResampler "
+                             "cross-attention blocks.")
+    parser.add_argument("--ef_resampler_layers", type=int, default=2,
+                        help="Number of stacked AudioResamplerBlock layers.")
 
     args = parser.parse_args()
 
@@ -810,6 +826,11 @@ def train_validation():
         logger.info(f"ef_nhead            : {args.ef_nhead}")
         logger.info(f"ef_num_layers       : {args.ef_num_layers}")
         logger.info(f"ef_dropout          : {args.ef_dropout}")
+        logger.info(f"ef_n_audio_queries  : {args.ef_n_audio_queries}")
+        logger.info(f"ef_resampler_heads  : {args.ef_resampler_heads}")
+        logger.info(f"ef_resampler_layers : {args.ef_resampler_layers}")
+        logger.info(f"UNet seq length     : {args.ef_n_audio_queries + 1 + 77} tokens "
+                    f"(N_q={args.ef_n_audio_queries} + sep=1 + T_t=77)")
         logger.info(f"cosine_loss         : {args.cosine_loss}")
         logger.info(f"trainable params    : {n_trainable:,}")
         logger.info(f"embeddings_dir      : {args.embeddings_dir}")
@@ -849,17 +870,23 @@ def train_validation():
                         (bv,), device=device,
                     ).long()
                     nl  = noise_scheduler.add_noise(lats, nv, tv)
-                    mp, fused_seq = model(af, iids, nl, tv)
-                    fused_pooled  = fused_seq.mean(dim=1)   # [B, output_size] per le loss
+                    mp, fused_seq, audio_summary = model(af, iids, nl, tv)
+                    # Pool for auxiliary losses:
+                    #   fused_pooled  — all tokens (audio + sep + text), for L1/L2 reg
+                    #   audio_pooled  — PRE-transformer audio tokens only, for cosine loss
+                    fused_pooled  = fused_seq.mean(dim=1)
+                    audio_pooled  = audio_summary.mean(dim=1)
 
                     tgt = (
                         nv if _prediction_type == "epsilon"
                         else noise_scheduler.get_velocity(lats, nv, tv).float()
                     )
+                    # LDM eq. (1/3): MSE on epsilon or velocity prediction
                     lv = F.mse_loss(mp, tgt, reduction="mean")
-                    _reg = args.lambda_a * torch.mean(torch.abs(fused_pooled))
+                    # [MUSIPAINTER-EQ3] L1 reg on audio_pooled (e_audio), not fused_pooled
+                    _reg = args.lambda_a * torch.mean(torch.abs(audio_pooled))
                     if args.lambda_b > 0:
-                        _reg = _reg + args.lambda_b * (torch.norm(fused_pooled, p=2, dim=1) ** 2).mean()
+                        _reg = _reg + args.lambda_b * (torch.norm(audio_pooled, p=2, dim=1) ** 2).mean()
                     lv = lv + _reg
 
                     if args.cosine_loss and _label_to_idx is not None:
@@ -868,11 +895,11 @@ def train_validation():
                         aidxs   = [j for j, l in enumerate(lbs) if l in _label_to_idx]
                         if ridxs:
                             idx_t = torch.tensor(ridxs, device=device)
-                            ct    = _label_matrix.index_select(0, idx_t)
-                            ae    = fused_pooled[aidxs]
+                            ct    = _label_matrix.index_select(0, idx_t)  # pre-normalised l̂
+                            ae    = audio_pooled[aidxs]
                             em_n  = F.normalize(ae.float(), dim=1)
-                            ct_n  = F.normalize(ct.float(), dim=1)
-                            cs    = (em_n * ct_n).sum(dim=1).mean()
+                            # ct already normalised in build_label_embedding_cache
+                            cs    = (em_n * ct.float()).sum(dim=1).mean()
                             lv    = lv + args.lambda_c * (1 - cs) ** 2
                 running_vloss += lv.item()
                 n_batches += 1
@@ -926,14 +953,28 @@ def train_validation():
             audio_features = batch["audio_features"]
             input_ids      = batch["input_ids"]
 
-            # [CFG-DROPOUT] Con probabilità cfg_dropout_prob azzera il conditioning
-            # audio o testo in modo casuale. Questo insegna al modello a generare
-            # anche senza conditioning, rendendo il CFG in inferenza efficace.
-            # Senza questo step, il guidance_scale in test produce immagini OOD.
-            CFG_DROPOUT_PROB = 0.10   # 10% dei batch ricevono conditioning azzerato
-
-            if torch.rand(1).item() < CFG_DROPOUT_PROB:
-                # Azzera tutto il conditioning (unconditional step)
+            # [CFG-DROPOUT] Asymmetric classifier-free guidance dropout.
+            # Ho & Salimans (2022): during training, randomly replace the
+            # conditioning with null/empty conditioning so the model learns
+            # both p(x|c) and p(x) (unconditional). At inference, CFG then
+            # amplifies the conditional signal: ε̃ = ε_uncond + s*(ε_cond - ε_uncond).
+            #
+            # Three distributions trained (total ~10% dropout, consistent with
+            # Ho & Salimans recommendation):
+            #   ~7%: audio zeroed, text kept  → teaches p(x | text only)
+            #   ~3%: both zeroed              → teaches p(x) unconditional
+            #   ~90%: normal                  → teaches p(x | audio, text)
+            #
+            # The asymmetry (text-only > fully uncond) is intentional: it
+            # enables the --uncond_mode=text_only inference path in
+            # test_no_accel_colab.py, where CFG amplifies the audio
+            # contribution above the text-only baseline.
+            _r = torch.rand(1).item()
+            if _r < 0.07:
+                # ~7%: zero audio only (teaches p(x|text))
+                audio_features = torch.zeros_like(audio_features)
+            elif _r < 0.10:
+                # ~3%: zero everything (teaches p(x) unconditional)
                 audio_features = torch.zeros_like(audio_features)
                 input_ids = torch.full_like(input_ids, tokenizer.pad_token_id or 0)
 
@@ -948,6 +989,7 @@ def train_validation():
                 else:
                     pixel_values = batch["pixel_values"]
                     with torch.no_grad():
+                        # LDM Sec. 3.1: scale latents by 1/σ (0.18215 for SD/SD2)
                         latents = (
                             base_model.vae.encode(
                                 pixel_values.to(dtype=torch.float16)
@@ -967,31 +1009,45 @@ def train_validation():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 if _prediction_type == "epsilon":
+                    # LDM eq. (1): predict the added noise ε
                     target = noise
                 elif _prediction_type == "v_prediction":
+                    # SD2 / v-parameterisation: predict the velocity v
                     target = noise_scheduler.get_velocity(
                         latents, noise, timesteps
                     ).float()
                 else:
                     raise ValueError(f"Unknown prediction type: {_prediction_type}")
 
-                model_pred, fused_seq = model(
+                model_pred, fused_seq, audio_summary = model(
                     audio_features, input_ids, noisy_latents, timesteps,
                 )
 
-                # [EARLY-FUSION-SEQ] Pool solo per le loss ausiliarie.
-                # Il UNet ha già ricevuto la sequenza completa all'interno di forward().
-                fused_pooled = fused_seq.mean(dim=1)   # [B, output_size]
+                # Pool for auxiliary losses (UNet already received the full sequence).
+                # fused_pooled: all tokens (audio + sep + text), for optional L1/L2 reg
+                # audio_pooled: PRE-transformer audio tokens only, for cosine loss
+                fused_pooled = fused_seq.mean(dim=1)
+                audio_pooled = audio_summary.mean(dim=1)
 
+                # LDM eq. (1/3): denoising MSE loss
                 loss = F.mse_loss(model_pred, target, reduction="mean")
 
-                # Regularisation: penalizza valori assoluti grandi nel vettore medio
-                _reg = args.lambda_a * torch.mean(torch.abs(fused_pooled))
+                # [MUSIPAINTER-EQ3] L1 regularisation on e_audio (audio_pooled).
+                # Musipainter eq. (3): L = L_LDM + λ_a ‖e_audio‖₁ + λ_c · CL
+                # Using audio_pooled (PRE-transformer) ensures regularisation
+                # targets the pure audio embedding, not the text-fused one.
+                _reg = args.lambda_a * torch.mean(torch.abs(audio_pooled))
                 if args.lambda_b > 0:
-                    _reg = _reg + args.lambda_b * (torch.norm(fused_pooled, p=2, dim=1) ** 2).mean()
+                    _reg = _reg + args.lambda_b * (torch.norm(audio_pooled, p=2, dim=1) ** 2).mean()
                 loss = loss + _reg
 
-                # Cosine loss: allinea il vettore medio fuso con l'embedding del label CLIP
+                # [MUSIPAINTER-EQ2/5] Cosine alignment loss: aligns pure audio
+                # tokens (PRE-transformer) with the pre-normalised CLIP label l̂.
+                # CL = (1 - <e_audio/‖e_audio‖, l̂>)²
+                # Using audio_pooled (PRE-transformer) is correct because l̂ is
+                # a CLIP text embedding — aligning a post-fusion (text-informed)
+                # audio vector against another text vector would collapse the
+                # audio modality into trivial text-text similarity.
                 if args.cosine_loss and _label_to_idx is not None:
                     labels   = batch['label']
                     row_idxs = [_label_to_idx[lbl] for lbl in labels if lbl in _label_to_idx]
@@ -999,11 +1055,10 @@ def train_validation():
                     if row_idxs:
                         idx_t     = torch.tensor(row_idxs, dtype=torch.long, device=device)
                         aud_idx_t = torch.tensor(aud_idxs, dtype=torch.long, device=device)
-                        ct        = _label_matrix.index_select(0, idx_t)
-                        at        = fused_pooled.index_select(0, aud_idx_t)
+                        ct        = _label_matrix.index_select(0, idx_t)      # pre-normalised l̂
+                        at        = audio_pooled.index_select(0, aud_idx_t)
                         em_n      = F.normalize(at.float(), dim=1)
-                        ct_n      = F.normalize(ct.float(), dim=1)
-                        cs        = (em_n * ct_n).sum(dim=1).mean()
+                        cs        = (em_n * ct.float()).sum(dim=1).mean()
                         loss      = loss + args.lambda_c * (1 - cs) ** 2
 
                 loss = loss / args.gradient_accumulation_steps

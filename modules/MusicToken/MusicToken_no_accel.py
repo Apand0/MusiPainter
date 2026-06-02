@@ -1,15 +1,14 @@
 # @title modules/MusicToken/MusicToken_no_accel.py
 """
-MusicToken_no_accel.py — Core model wrapper for the Musipainter pipeline.
+MusicToken_no_accel.py — Core model wrapper for Musipainter (v10, Audio Resampler).
 
-Wraps VAE, UNet, frozen CLIP token embeddings, BEATs audio encoder and the
-trainable EarlyFusionEncoder into a single nn.Module for training and inference.
-
-[EARLY-FUSION-SEQ] The EarlyFusionEncoder now returns a full sequence
-[B, T_a+T_t, output_size] instead of a single pooled vector [B, output_size].
-This sequence is passed directly as encoder_hidden_states to the UNet so that
-its cross-attention layers can attend to different fused tokens for different
-spatial regions of the generated image — matching the original LDM design.
+[AUDIO-RESAMPLER v10]
+EarlyFusionEncoder now uses an AudioResampler that compresses the full audio
+sequence [B, T_a, d_model] → [B, N_q, d_model] via learnable cross-attention
+queries, then fuses with text. The UNet receives
+[B, N_q + 1 + T_t, output_size] with N_q fixed (default 32), making the
+sequence length stride-agnostic. The +1 accounts for the FuseLIP separator
+token inserted between audio summary tokens and text tokens.
 """
 
 import gc
@@ -27,44 +26,26 @@ logger = logging.getLogger(__name__)
 
 
 def _load_weights(path, map_device) -> dict:
-    """
-    Load model weights from a .safetensors or legacy .bin/.pt file.
-
-    Resolution order:
-      1. .safetensors path → load_safetensors (pickle-free).
-      2. Otherwise → torch.load (legacy .bin or .pt checkpoint).
-    Auto-switches from .bin to .safetensors when .bin is not found.
-    """
     import os
     resolved = str(path)
-
     if not os.path.exists(resolved) and resolved.endswith(".bin"):
         sf_candidate = resolved[:-4] + ".safetensors"
         if os.path.exists(sf_candidate):
             logger.info(f"[_load_weights] .bin not found, auto-switching to: {sf_candidate}")
             resolved = sf_candidate
-
     if not os.path.exists(resolved):
         raise FileNotFoundError(f"[_load_weights] Weight file not found: {resolved}")
-
     if resolved.endswith(".safetensors"):
         from modules.preprocess.utils import load_safetensors
         return load_safetensors(resolved, device=str(map_device))
-
     return torch.load(resolved, map_location=map_device)
 
 
 class MusicTokenWrapper(nn.Module):
     """
-    Wraps VAE, UNet, CLIP token embeddings, BEATs audio encoder and
-    EarlyFusionEncoder into a single nn.Module for training and inference.
+    Wraps VAE, UNet, CLIP token embeddings, BEATs and EarlyFusionEncoder.
 
-    Only EarlyFusionEncoder (and optionally LoRA layers) has requires_grad=True.
-    All other components are frozen in float16 to save VRAM.
-
-    [EARLY-FUSION-SEQ] forward() now receives fused_seq [B, T, output_size]
-    from EarlyFusionEncoder and passes it directly to the UNet without
-    collapsing the sequence dimension.
+    Only EarlyFusionEncoder (and optional LoRA) has requires_grad=True.
     """
 
     def __init__(self, args):
@@ -96,9 +77,7 @@ class MusicTokenWrapper(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # ── CLIP token embedding table (frozen) ───────────────────────────────
-        # Only the nn.Embedding weight is retained; the full CLIP transformer
-        # is discarded after extraction (~400 MB VRAM saved).
+        # ── CLIP token embedding (frozen, full transformer discarded) ─────────
         from transformers import CLIPTextModel as _CLIPTextModel
         _clip = _CLIPTextModel.from_pretrained(
             args.pretrained_model_name_or_path,
@@ -114,7 +93,7 @@ class MusicTokenWrapper(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # ── BEATs audio encoder (frozen) ──────────────────────────────────────
+        # ── BEATs audio encoder (frozen, optional) ────────────────────────────
         if hasattr(args, 'use_precomputed_embeddings') and args.use_precomputed_embeddings:
             logger.info("Pre-computed embeddings — BEATs not loaded.")
             self.aud_encoder = None
@@ -132,17 +111,30 @@ class MusicTokenWrapper(nn.Module):
             gc.collect()
 
         # ── Dimensions ────────────────────────────────────────────────────────
-        audio_dim   = 768 * 3
-        output_size = self.unet.config.cross_attention_dim
-        d_model     = getattr(args, 'ef_d_model',    512)
-        nhead       = getattr(args, 'ef_nhead',        8)
-        num_layers  = getattr(args, 'ef_num_layers',   4)
-        dropout     = getattr(args, 'ef_dropout',    0.1)
+        audio_dim        = 768 * 3
+        output_size      = self.unet.config.cross_attention_dim
+        d_model          = getattr(args, 'ef_d_model',          512)
+        nhead            = getattr(args, 'ef_nhead',              8)
+        num_layers       = getattr(args, 'ef_num_layers',         4)
+        dropout          = getattr(args, 'ef_dropout',          0.1)
+        # [AUDIO-RESAMPLER v10] new args
+        n_audio_queries  = getattr(args, 'ef_n_audio_queries',   32)
+        resampler_heads  = getattr(args, 'ef_resampler_heads',    8)
+        resampler_layers = getattr(args, 'ef_resampler_layers',   2)
 
         logger.info(
-            f"EarlyFusionEncoder: audio_dim={audio_dim}, text_dim={self._text_dim}, "
-            f"output_size={output_size}, d_model={d_model}, nhead={nhead}, "
-            f"num_layers={num_layers}"
+            f"EarlyFusionEncoder (v10-Resampler): "
+            f"audio_dim={audio_dim}, text_dim={self._text_dim}, "
+            f"output_size={output_size}, d_model={d_model}, "
+            f"nhead={nhead}, num_layers={num_layers}, "
+            f"n_audio_queries={n_audio_queries}, "
+            f"resampler_heads={resampler_heads}, "
+            f"resampler_layers={resampler_layers}"
+        )
+        logger.info(
+            f"[RESAMPLER] Output sequence length = "
+            f"N_q({n_audio_queries}) + sep(1) + T_t(77) = {n_audio_queries + 1 + 77} tokens "
+            f"(stride-agnostic; was T_a+T_t per stride)"
         )
 
         # ── Trainable EarlyFusionEncoder ──────────────────────────────────────
@@ -154,9 +146,11 @@ class MusicTokenWrapper(nn.Module):
             nhead=nhead,
             num_layers=num_layers,
             dropout=dropout,
+            n_audio_queries=n_audio_queries,
+            resampler_heads=resampler_heads,
+            resampler_layers=resampler_layers,
         )
-        # Alias kept for checkpoint helpers compatibility.
-        self.embedder = self.early_fusion
+        self.embedder = self.early_fusion  # alias for checkpoint helpers
 
         # ── Eval mode for frozen components ───────────────────────────────────
         self.vae.eval()
@@ -165,7 +159,7 @@ class MusicTokenWrapper(nn.Module):
         if self.aud_encoder is not None:
             self.aud_encoder.eval()
 
-        # ── Optional LoRA adapters on UNet attention layers ───────────────────
+        # ── Optional LoRA adapters ─────────────────────────────────────────────
         if hasattr(args, 'lora') and args.lora:
             lora_attn_procs = {}
             for name in self.unet.attn_processors.keys():
@@ -264,13 +258,7 @@ class MusicTokenWrapper(nn.Module):
     # ──────────────────────────────────────────────────────────────────────────
     def _get_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
-        Look up CLIP token embeddings for a batch of token-ID sequences.
-
-        Args:
-            input_ids: [B, seq_len] long
-
-        Returns:
-            [B, seq_len, text_dim] float32
+        Look up CLIP token embeddings [B, seq_len] → [B, seq_len, text_dim].
         """
         with torch.no_grad():
             text_embeds = self.token_embedding(input_ids).float()
@@ -287,18 +275,39 @@ class MusicTokenWrapper(nn.Module):
         """
         Forward pass.
 
+        LDM conditioning (Rombach et al., Sec. 3.3):
+          EarlyFusionEncoder acts as the domain-specific encoder τ_θ that maps
+          the multimodal conditioning signal (audio + text) to a sequence
+          τ_θ(y) ∈ R^{M×d_τ} fed to the UNet cross-attention layers as
+          encoder_hidden_states. The UNet then implements:
+            Attention(Q, K, V) with Q = W_Q · ϕ_i(z_t),
+                                     K = W_K · τ_θ(y),
+                                     V = W_V · τ_θ(y).
+
         Args:
             audio_features : [B, T_a, 2304]    float32
-                             T_a depends on temporal_pool_stride used at
-                             preprocessing (stride=4 → T_a≈94, stride=8 → T_a≈47).
             input_ids      : [B, seq_len]       long
             noisy_latents  : [B, 4, H/8, W/8]  float16
             timesteps      : [B]                long
 
         Returns:
-            model_pred : [B, 4, H/8, W/8] float32
-            fused_seq  : [B, T_a+T_t, output_size] float32
-                         Full fused sequence (used by training loop for aux losses).
+            model_pred     : [B, 4, H/8, W/8]  float32
+                             UNet noise/velocity prediction (LDM eq. 1/3).
+
+            fused_seq      : [B, N_q + 1 + T_t, output_size]  float32
+                             Full fused sequence (audio summary + sep + text),
+                             post shared-Transformer and output_proj.
+                             Used for optional L1/L2 regularisation on the
+                             pooled representation.
+
+            audio_summary  : [B, N_q, output_size]  float32
+                             PRE-transformer audio summary tokens projected via
+                             loss_proj. Pure audio representation before
+                             cross-modal fusion with text. Used for the
+                             Musipainter cosine alignment loss (eq. 2/5):
+                               CL = (1 - <e_audio / ‖e_audio‖, l̂>)²
+                             where l̂ is the pre-normalised CLIP label vector
+                             (built in build_label_embedding_cache).
         """
         text_tokens = self._get_text_embeddings(input_ids)  # [B, T_t, text_dim]
 
@@ -308,19 +317,17 @@ class MusicTokenWrapper(nn.Module):
             else audio_features
         )
 
-        # [EARLY-FUSION-SEQ] EarlyFusionEncoder now returns the full sequence
-        # [B, T_a+T_t, output_size] instead of a single pooled vector.
-        fused_seq = self.early_fusion(
+        # EarlyFusionEncoder returns:
+        #   fused_seq     : [B, N_q+1+T_t, output_size]  — for UNet + L1/L2 reg
+        #   audio_summary : [B, N_q, output_size]         — PRE-transformer,
+        #                   for cosine loss (Musipainter eq. 2/5)
+        fused_seq, audio_summary = self.early_fusion(
             audio_tokens=audio_feats,
             text_tokens=text_tokens,
-        )   # [B, T_a+T_t, output_size]
+            return_audio_summary=True,
+        )
 
-        # [EARLY-FUSION-SEQ] Pass the full sequence directly as
-        # encoder_hidden_states. No .unsqueeze(1) needed: the sequence
-        # dimension is already T_a+T_t, giving the UNet cross-attention
-        # meaningful K and V to attend to.
         encoder_hidden_states = fused_seq.to(dtype=noisy_latents.dtype)
-        # [B, T_a+T_t, output_size]
 
         model_pred = self.unet(
             noisy_latents if noisy_latents.dtype == torch.float16
@@ -329,4 +336,4 @@ class MusicTokenWrapper(nn.Module):
             encoder_hidden_states,
         ).sample.float()
 
-        return model_pred, fused_seq
+        return model_pred, fused_seq, audio_summary
