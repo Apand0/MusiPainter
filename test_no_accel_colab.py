@@ -1,8 +1,8 @@
 # @title test_no_accel_colab.py
 """
-Inference script for Musipainter (Early Fusion branch).
+Inference script for Musipainter (Audio-Guided Cross-Attention branch).
 
-Generates images from audio embeddings using EarlyFusionEncoder +
+Generates images from audio embeddings using FullAudioGuidedCrossAttentionEncoder +
 frozen Stable Diffusion UNet. Audio embeddings are loaded via
 LazyEmbeddingIndex which accepts a comma-separated --embeddings_dir
 pointing to one or more Kaggle Dataset directories.
@@ -14,13 +14,10 @@ fails with a size mismatch regardless of which temporal_pool_stride
 was used during preprocessing.
 
 Note on sequence lengths:
-  EarlyFusionEncoder outputs [B, actual_T_a + 1 + T_t, output_size] where:
-  actual_T_a = n_audio_queries (if >0) or T_a (if 0)
-  1   = FuseLIP separator token
-  T_t = 77 — CLIP text tokens
-  The +1 separator is handled internally by EarlyFusionEncoder and is
-  transparent to the UNet, which simply attends over the full sequence
-  as encoder_hidden_states (LDM Sec. 3.3).
+  FullAudioGuidedCrossAttentionEncoder outputs [B, T_a, output_size] where:
+  T_a = full audio sequence length (no resampler, no separator token)
+  The UNet attends over the full audio sequence as encoder_hidden_states
+  (LDM Sec. 3.3).
 """
 
 import argparse
@@ -113,17 +110,17 @@ def parse_args():
     parser.add_argument("--center_crop", action="store_true", default=False)
     parser.add_argument("--hf_cache_dir", type=str, default="/tmp/hf_model_cache")
 
-    # Early Fusion hyper-parameters (must match training config)
+    # Audio-Guided Cross-Attention hyper-parameters (must match training config)
     parser.add_argument("--ef_d_model", type=int, default=512,
-                        help="EarlyFusionEncoder shared Transformer hidden dim.")
+                        help="Cross-Attention encoder hidden dim.")
     parser.add_argument("--ef_nhead", type=int, default=8,
-                        help="EarlyFusionEncoder number of attention heads.")
+                        help="Cross-Attention number of attention heads.")
     parser.add_argument("--ef_num_layers", type=int, default=4,
-                        help="EarlyFusionEncoder number of Transformer layers.")
+                        help="Cross-Attention number of layers.")
     parser.add_argument("--ef_dropout", type=float, default=0.1,
-                        help="EarlyFusionEncoder dropout rate.")
-    parser.add_argument("--ef_n_audio_queries", type=int, default=1,
-                        help="0=Full T_a (FuseLIP), 1=AttentivePooling (MusiPainter, default), >1=Resampler")
+                        help="Cross-Attention dropout rate.")
+    # ef_n_audio_queries rimosso — non più necessario con full sequence
+
     parser.add_argument(
         "--uncond_mode", type=str, default="zeros",
         choices=["zeros", "text_only"],
@@ -165,9 +162,9 @@ def _resolve_checkpoint_path(explicit_path, output_dir, stem, label):
       3. <output_dir>/<stem>.safetensors
       4. <output_dir>/<stem>.bin
       5. Most-recent best_model_<label>_*.safetensors in output_dir
-      6. Most-recent best_model_early_fusion_*.safetensors in output_dir
+      6. Most-recent best_model_audio_guided_cross_attn_*.safetensors in output_dir
       7. Most-recent weights/*_<label>-step*.safetensors in output_dir/weights/
-      8. Most-recent weights/*_early_fusion-step*.safetensors
+      8. Most-recent weights/*_audio_guided_cross_attn-step*.safetensors in output_dir/weights/
     """
     import glob
 
@@ -185,9 +182,9 @@ def _resolve_checkpoint_path(explicit_path, output_dir, stem, label):
     glob_patterns = [
         os.path.join(output_dir, f"best_model_{label}_*.safetensors"),
         os.path.join(output_dir, f"best_model_{label}_*.bin"),
-        os.path.join(output_dir, f"best_model_early_fusion_*.safetensors"),
+        os.path.join(output_dir, f"best_model_audio_guided_cross_attn_*.safetensors"),
         os.path.join(output_dir, "weights", f"*_{label}-step*.safetensors"),
-        os.path.join(output_dir, "weights", f"*_early_fusion-step*.safetensors"),
+        os.path.join(output_dir, "weights", f"*_audio_guided_cross_attn-step*.safetensors"),
         os.path.join(output_dir, "weights", f"*_{label}-step*.bin"),
     ]
     for pat in glob_patterns:
@@ -213,11 +210,9 @@ def _probe_audio_frame_count(dataset) -> int:
     precomputed embeddings ensures the unconditional sequence always matches
     the conditional one regardless of which temporal_pool_stride was used.
 
-    Note: T_a is the number of BEATs frames in the precomputed embeddings,
-    NOT the output sequence length of EarlyFusionEncoder. UNet directly 
-    processes actual_T_a + 1 + T_t tokens, preserving the full temporal resolution
-    T_a is only needed here to size the silent audio tensor passed to
-    EarlyFusionEncoder when building the unconditional CFG embedding.
+    Note: T_a is the number of BEATs frames in the precomputed embeddings.
+    FullAudioGuidedCrossAttentionEncoder passes the full T_a sequence
+    directly to the UNet as encoder_hidden_states.
 
     stride=1  → T_a ≈ 376
     stride=4  → T_a ≈ 94
@@ -255,11 +250,9 @@ def _build_uncond_embedding(
     where s = guidance_scale and ε_uncond is produced by this function.
 
     The silent audio tensor has shape [1, t_a, 2304] where t_a is inferred
-    dynamically from the dataset. The output retains the audio's native dimensions, 
-    always resulting in: [1, actual_T_a + 1 + T_t, output_size]
-    regardless of t_a. This matches the shape of the conditional embedding
-    produced in the generation loop, ensuring torch.cat([uncond, cond]) always
-    succeeds without a size mismatch.
+    dynamically from the dataset. The output is [1, T_a, output_size]
+    (full audio sequence conditioned by text/empty text), matching the shape
+    of the conditional embedding produced in the generation loop.
 
     Args:
         args:         parsed CLI args (uncond_mode, prompt, placeholder_token).
@@ -270,7 +263,7 @@ def _build_uncond_embedding(
         device:       CUDA or CPU device.
 
     Returns:
-        uncond_embeddings: [1, actual_T_a + 1 + T_t, output_size] float tensor.
+        uncond_embeddings: [1, T_a, output_size] float tensor.
     """
     audio_dim     = 768 * 3          # BEATs layers 4+8+12 concatenated
     silent_audio  = torch.zeros(1, t_a, audio_dim, dtype=weight_dtype, device=device)
@@ -291,7 +284,7 @@ def _build_uncond_embedding(
             uncond_embeddings = base_model.early_fusion(
                 audio_tokens=silent_audio,
                 text_tokens=uncond_text,
-            )   # [1, actual_T_a+1+T_t, output_size]
+            )   # [1, T_a, output_size]
 
             logger.info(
                 f"[CFG] uncond_mode=zeros | "
@@ -303,7 +296,7 @@ def _build_uncond_embedding(
             # Prompt text without the placeholder + silent audio → corresponds
             # to p(x|text), the text-conditioned distribution trained via the
             # ~7% audio-only dropout. CFG with this baseline amplifies exactly
-            # the audio contribution above the text-only representation:
+            # the audio contribution above the text-only baseline:
             #   ε̃ = ε_text + s * (ε_audio+text - ε_text)
             text_only_prompt = args.prompt.replace(args.placeholder_token, "").strip()
             uncond_ids = tokenizer(
@@ -318,7 +311,7 @@ def _build_uncond_embedding(
             uncond_embeddings = base_model.early_fusion(
                 audio_tokens=silent_audio,
                 text_tokens=uncond_text,
-            )   # [1, actual_T_a+1+T_t, output_size]
+            )   # [1, T_a, output_size]
 
             logger.info(
                 f"[CFG] uncond_mode=text_only | "
@@ -335,7 +328,7 @@ def _build_uncond_embedding(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def inference(args):
-    """Run Early Fusion inference loop and save generated images."""
+    """Run Audio-Guided Cross-Attention inference loop and save generated images."""
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "imgs"), exist_ok=True)
@@ -358,16 +351,8 @@ def inference(args):
         if _n_gpus > 0 else "CPU"
     )
 
-    _n_q = getattr(args, 'ef_n_audio_queries', 1)
-    _seq_desc = (
-        f"T_a + 1 + 77 (Full Temporal Resolution)"
-        if _n_q == 0 else
-        f"{_n_q} + 1 + 77 (Resampler)" if _n_q > 1 else
-        f"1 + 1 + 77 (AttentivePooling)"
-    )
-
     logger.info("=" * 60)
-    logger.info("START: INFERENCE — Early Fusion branch")
+    logger.info("START: INFERENCE — Audio-Guided Cross-Attention branch")
     logger.info(f"timestamp           : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"GPU                 : {_n_gpus}  ({_gpu_info})")
     logger.info(f"base_model          : {args.pretrained_model_name_or_path}")
@@ -381,8 +366,7 @@ def inference(args):
     logger.info(f"ef_nhead            : {args.ef_nhead}")
     logger.info(f"ef_num_layers       : {args.ef_num_layers}")
     logger.info(f"ef_dropout          : {args.ef_dropout}")
-    logger.info(f"ef_n_audio_queries  : {_n_q}")
-    logger.info(f"UNet seq length     : {_seq_desc}")
+    logger.info(f"UNet seq length     : T_a (full audio sequence)")
     logger.info(f"embeddings_dir      : {args.embeddings_dir}")
     logger.info(f"embeddings_preload  : {args.embeddings_preload_all}")
     logger.info(f"learned_embeds      : {args.learned_embeds}")
@@ -393,7 +377,7 @@ def inference(args):
         explicit_path=args.learned_embeds,
         output_dir=args.output_dir,
         stem="learned_embeds",
-        label="early_fusion",
+        label="audio_guided_cross_attn",
     )
     logger.info(f"[AUTO-CHECKPOINT] Resolved: {args.learned_embeds}")
     if args.lora:
@@ -452,8 +436,8 @@ def inference(args):
     # ── Dynamic T_a probe ─────────────────────────────────────────────────────
     # [FIX-CFG-T_A] Read the actual BEATs frame count from the first dataset
     # sample. This is needed only to size the silent audio tensor for the
-    # unconditional CFG embedding; the EarlyFusionEncoder will compress it
-    # internally based on n_audio_queries, so the UNet always sees actual_T_a+1+T_t tokens.
+    # unconditional CFG embedding; the FullAudioGuidedCrossAttentionEncoder
+    # processes the full T_a sequence directly.
     t_a: int = _probe_audio_frame_count(test_dataset)
 
     # ── Unconditional embedding for CFG (built once, reused for all samples) ──
@@ -512,19 +496,19 @@ def inference(args):
 
         with torch.no_grad():
             # ── Conditional embedding (audio + text fused) ────────────────────
-            # EarlyFusionEncoder: τ_θ(audio, text) → [1, actual_T_a+1+T_t, output_size]
+            # FullAudioGuidedCrossAttentionEncoder: τ_θ(audio, text) → [1, T_a, output_size]
             text_tokens = base_model._get_text_embeddings(cond_input_ids).to(weight_dtype)
             cond_embeddings = base_model.early_fusion(
                 audio_tokens=aud_features,
                 text_tokens=text_tokens,
-            )   # [1, actual_T_a+1+T_t, output_size]
+            )   # [1, T_a, output_size]
 
             # CFG (LDM Sec. 4 / Ho & Salimans 2022):
-            # stack uncond + cond → [2, actual_T_a+1+T_t, output_size]
-            # Both tensors have the same sequence length because the
-            # EarlyFusionEncoder uses the same n_audio_queries for both.
+            # stack uncond + cond → [2, T_a, output_size]
+            # Both tensors have the same sequence length because
+            # FullAudioGuidedCrossAttentionEncoder processes the full T_a sequence.
             text_embeddings = torch.cat([uncond_embeddings, cond_embeddings])
-            # [2, actual_T_a+1+T_t, output_size]
+            # [2, T_a, output_size]
 
             # ── Latent diffusion (LDM Sec. 3.2) ──────────────────────────────
             seed = random.randint(0, 10000)

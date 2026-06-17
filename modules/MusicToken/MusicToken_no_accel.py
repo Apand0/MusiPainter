@@ -1,14 +1,11 @@
 # @title modules/MusicToken/MusicToken_no_accel.py
 """
-MusicToken_no_accel.py — Core model wrapper per Musipainter (Strada B).
+MusicToken_no_accel.py — Core model wrapper per Musipainter (Cross-Attention).
 
-[STRADA B — Early Fusion Continua]
-EarlyFusionEncoder usa Attentive Pooling che collassa la sequenza audio
-[B, T_a, d_model] → [B, 1, d_model], poi fonde con testo.
-La UNet riceve [B, actual_T_a + 1 + T_t, output_size] dove:
-    actual_T_a = n_audio_queries (se >0) altrimenti T_a
-    1   = FuseLIP separator token
-    T_t = 77 (CLIP text tokens)
+[Audio-Guided Cross-Attention]
+FullAudioGuidedCrossAttentionEncoder utilizza l'intera sequenza audio
+[B, T_a, d_model] e la condiziona tramite Cross-Attention asimmetrica
+dove Q=Audio e K/V=Testo. La UNet riceve [B, T_a, output_size].
 """
 
 import gc
@@ -20,7 +17,7 @@ from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.models.attention_processor import LoRAAttnProcessor
 
 from modules.BEATs.BEATs import BEATs, BEATsConfig
-from modules.fusion.early_fusion_encoder import EarlyFusionEncoder
+from modules.fusion.cross_attention_encoder import FullAudioGuidedCrossAttentionEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +40,9 @@ def _load_weights(path, map_device) -> dict:
 
 class MusicTokenWrapper(nn.Module):
     """
-    Wraps VAE, UNet, CLIP token embeddings, BEATs and EarlyFusionEncoder.
+    Wraps VAE, UNet, CLIP token embeddings, BEATs and FullAudioGuidedCrossAttentionEncoder.
 
-    Only EarlyFusionEncoder (and optional LoRA) has requires_grad=True.
+    Only FullAudioGuidedCrossAttentionEncoder (and optional LoRA) has requires_grad=True.
     """
 
     def __init__(self, args):
@@ -117,18 +114,16 @@ class MusicTokenWrapper(nn.Module):
         nhead = getattr(args, 'ef_nhead', 8)
         num_layers = getattr(args, 'ef_num_layers', 4)
         dropout = getattr(args, 'ef_dropout', 0.1)
-        n_audio_queries = getattr(args, 'ef_n_audio_queries', 1)
 
         logger.info(
-            f"EarlyFusionEncoder (Strada B — Flessibile): "
-            f"n_audio_queries={n_audio_queries} (0=Full, 1=Pooling, >1=Resampler), "
+            f"FullAudioGuidedCrossAttentionEncoder: "
             f"audio_dim={audio_dim}, text_dim={self._text_dim}, "
             f"output_size={output_size}, d_model={d_model}, "
             f"nhead={nhead}, num_layers={num_layers}, dropout={dropout}"
         )
 
-        # ── Trainable EarlyFusionEncoder ──────────────────────────────────────
-        self.early_fusion = EarlyFusionEncoder(
+        # ── Trainable FullAudioGuidedCrossAttentionEncoder ────────────────────
+        self.early_fusion = FullAudioGuidedCrossAttentionEncoder(
             audio_dim=audio_dim,
             text_dim=self._text_dim,
             output_size=output_size,
@@ -136,9 +131,9 @@ class MusicTokenWrapper(nn.Module):
             nhead=nhead,
             num_layers=num_layers,
             dropout=dropout,
-            n_audio_queries=n_audio_queries,
+            max_audio_len=1024,  # Assicurati che copra il tuo T_a massimo (es. 376)
         )
-        self.embedder = self.early_fusion  # alias for checkpoint helpers
+        self.embedder = self.early_fusion  # alias per checkpoint helpers
 
         # ── Eval mode for frozen components ───────────────────────────────────
         self.vae.eval()
@@ -223,8 +218,7 @@ class MusicTokenWrapper(nn.Module):
             self.early_fusion.load_state_dict(_state)
             if hasattr(args, 'vae') and args.vae:
                 self.vae.load_state_dict(_load_weights(args.learned_vae, map_device))
-            if hasattr(args, 'aud_encoder') and args.aud_encoder \
-               and self.aud_encoder is not None:
+            if hasattr(args, 'aud_encoder') and args.aud_encoder and self.aud_encoder is not None:
                 self.aud_encoder.load_state_dict(
                     _load_weights(args.learned_aud_encoder, map_device)
                 )
@@ -264,8 +258,8 @@ class MusicTokenWrapper(nn.Module):
         Forward pass.
 
         LDM conditioning (Rombach et al., Sec. 3.3):
-          EarlyFusionEncoder acts as the domain-specific encoder τ_θ that maps
-          the multimodal conditioning signal (audio + text) to a sequence
+          FullAudioGuidedCrossAttentionEncoder acts as the domain-specific encoder τ_θ
+          that maps the multimodal conditioning signal (audio + text) to a sequence
           τ_θ(y) ∈ R^{M×d_τ} fed to the UNet cross-attention layers as
           encoder_hidden_states.
 
@@ -279,17 +273,13 @@ class MusicTokenWrapper(nn.Module):
             model_pred     : [B, 4, H/8, W/8]  float32
                              UNet noise/velocity prediction.
 
-            fused_seq      : [B, actual_T_a + 1 + T_t, output_size]  float32
-                             Full fused sequence (audio + sep + text),
-                             post shared-Transformer and output_proj.
+            fused_seq      : [B, T_a, output_size]  float32
+                             Full audio sequence conditioned by text,
+                             post cross-attention and output_proj.
 
-            audio_summary  : [B, 1, output_size]  float32
-                             PRE-transformer attentively-pooled audio token
-                             projected via loss_proj. Shape is always
-                             [B, 1, output_size] regardless of n_audio_queries
-                             routing mode, because AttentivePooling always
-                             collapses T_a → 1 before routing. Used for the
-                             Musipainter cosine alignment loss (eq. 2/5):
+            audio_summary  : [B, T_a, output_size]  float32
+                             PRE-cross-attention audio tokens projected via loss_proj.
+                             Used for the Musipainter cosine alignment loss (eq. 2/5):
                                CL = (1 - <e_audio / ||e_audio||, l_hat>)^2
         """
         text_tokens = self._get_text_embeddings(input_ids)  # [B, T_t, text_dim]
@@ -300,9 +290,9 @@ class MusicTokenWrapper(nn.Module):
             else audio_features
         )
 
-        # EarlyFusionEncoder returns:
-        #   fused_seq     : [B, actual_T_a + 1 + T_t, output_size]  — for UNet + L1/L2 reg
-        #   audio_summary : [B, 1, output_size]          — PRE-transformer,
+        # FullAudioGuidedCrossAttentionEncoder returns:
+        #   fused_seq     : [B, T_a, output_size]  — for UNet
+        #   audio_summary : [B, T_a, output_size]  — PRE-cross-attention,
         #                   for cosine loss (Musipainter eq. 2/5)
         fused_seq, audio_summary = self.early_fusion(
             audio_tokens=audio_feats,

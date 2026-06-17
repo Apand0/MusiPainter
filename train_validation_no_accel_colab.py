@@ -1,5 +1,5 @@
 # @title train_validation_no_accel_colab.py
-"""DDP Training & Validation for Musipainter (Early Fusion branch).
+"""DDP Training & Validation for Musipainter (Audio-Guided Cross-Attention branch).
 
 Supports single-GPU and multi-GPU (torchrun) modes.
 Audio embeddings are loaded via LazyEmbeddingIndex which accepts a
@@ -151,7 +151,7 @@ def save_checkpoint(embedder, optimizer, scaler, lr_scheduler, global_step,
         "scaler_state_dict":       scaler.state_dict(),
         "lr_scheduler_state_dict": lr_scheduler.state_dict(),
         "timestamp":               timestamp,
-        "arch":                    "early_fusion_v9",
+        "arch":                    "audio_guided_cross_attn_v1",
     }
     if lora_layers is not None:
         ckpt["lora_state_dict"] = lora_layers.state_dict()
@@ -179,11 +179,11 @@ def load_checkpoint(resume_path, embedder, optimizer, scaler, lr_scheduler,
     if best_model_path is not None and not os.path.exists(best_model_path):
         logger.warning(f"[RESUME] best_model_path not found on disk: {best_model_path}.")
         best_model_path = None
-    _arch = ckpt.get("arch", "late_fusion_v8")
-    if _arch != "early_fusion_v9":
+    _arch = ckpt.get("arch", "early_fusion_v9")
+    if _arch != "audio_guided_cross_attn_v1":
         logger.warning(
-            f"[RESUME] Checkpoint arch='{_arch}' — was trained with Late Fusion. "
-            "Weights may not be compatible with EarlyFusionEncoder."
+            f"[RESUME] Checkpoint arch='{_arch}' — was trained with a different architecture. "
+            "Weights may not be compatible with FullAudioGuidedCrossAttentionEncoder."
         )
     logger.info(f"[RESUME] Resuming from step={global_step}, best_vloss={best_vloss:.4f}.")
     return global_step, best_vloss, best_model_path
@@ -209,12 +209,12 @@ def load_embedder_weights(weight_path, embedder, device, resume_step: int = 0):
         logger.warning(f"[RESUME-WEIGHTS] Missing keys: {missing}")
     if unexpected:
         logger.warning(f"[RESUME-WEIGHTS] Unexpected keys: {unexpected}")
-    logger.info(f"[RESUME-WEIGHTS] EarlyFusionEncoder loaded (resume_step={resume_step})")
+    logger.info(f"[RESUME-WEIGHTS] FullAudioGuidedCrossAttentionEncoder loaded (resume_step={resume_step})")
     return resume_step, float('inf')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LABEL EMBEDDING CACHE  (Early Fusion version)
+#  LABEL EMBEDDING CACHE  (Audio-Guided Cross-Attention version)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_label_embedding_cache(tokenizer, token_embedding, all_labels, device):
@@ -431,17 +431,16 @@ def parse_args():
     parser.add_argument("--hf_cache_dir", type=str, default="/tmp/hf_model_cache")
     parser.add_argument("--latents_dir", type=str, default="./image_latents/")
 
-    # ── Early Fusion hyper-parameters ────────────────────────────────────────
+    # ── Audio-Guided Cross-Attention hyper-parameters ───────────────────────
     parser.add_argument("--ef_d_model", type=int, default=512,
-                        help="EarlyFusionEncoder shared Transformer hidden dim.")
+                        help="Cross-Attention encoder hidden dim.")
     parser.add_argument("--ef_nhead", type=int, default=8,
-                        help="EarlyFusionEncoder number of attention heads.")
+                        help="Cross-Attention number of attention heads.")
     parser.add_argument("--ef_num_layers", type=int, default=4,
-                        help="EarlyFusionEncoder number of Transformer layers.")
+                        help="Cross-Attention number of layers.")
     parser.add_argument("--ef_dropout", type=float, default=0.1,
-                        help="EarlyFusionEncoder dropout rate.")
-    parser.add_argument("--ef_n_audio_queries", type=int, default=1,
-                        help="0=Full T_a (FuseLIP), 1=AttentivePooling (MusiPainter, default), >1=Resampler")
+                        help="Cross-Attention dropout rate.")
+    # ef_n_audio_queries rimosso — non più necessario con full sequence
 
     args = parser.parse_args()
 
@@ -475,7 +474,7 @@ def train_validation():
     if is_main:
         _n_gpus = torch.cuda.device_count()
         print(f"\n{'='*60}")
-        print(f"  Musipainter — Early Fusion")
+        print(f"  Musipainter — Audio-Guided Cross-Attention")
         print(f"  GPUs available    : {_n_gpus}")
         mode_str = f"DDP ({world_size}x GPU)" if is_ddp else "Single GPU"
         print(f"  Mode              : {mode_str}")
@@ -509,10 +508,10 @@ def train_validation():
             cache_dir=_hf_cache,
         )
 
-    # Early Fusion: no placeholder injection into CLIP.
+    # Audio-Guided Cross-Attention: no placeholder injection into CLIP.
     # The tokenizer is used only to convert text labels/prompts to token IDs.
     logger.info(
-        "Tokenizer loaded — Early Fusion mode: "
+        "Tokenizer loaded — Audio-Guided Cross-Attention mode: "
         "no <*> injection into CLIP text encoder."
     )
 
@@ -642,14 +641,14 @@ def train_validation():
 
     model = model.to(device)
 
-    # torch.compile on EarlyFusionEncoder
+    # torch.compile on FullAudioGuidedCrossAttentionEncoder
     try:
         base_model.early_fusion = torch.compile(
             base_model.early_fusion, mode="default", fullgraph=False
         )
         base_model.embedder = base_model.early_fusion
         if is_main:
-            logger.info("EarlyFusionEncoder compiled.")
+            logger.info("FullAudioGuidedCrossAttentionEncoder compiled.")
     except Exception as e:
         if is_main:
             logger.info(f"torch.compile skipped: {e}")
@@ -679,7 +678,7 @@ def train_validation():
     if is_main:
         logger.info(
             f"Trainable parameters: {n_trainable:,} "
-            f"(EarlyFusionEncoder{' + LoRA' if args.lora else ''})"
+            f"(FullAudioGuidedCrossAttentionEncoder{' + LoRA' if args.lora else ''})"
         )
 
     optimizer = torch.optim.AdamW(
@@ -819,8 +818,7 @@ def train_validation():
         logger.info(f"ef_nhead            : {args.ef_nhead}")
         logger.info(f"ef_num_layers       : {args.ef_num_layers}")
         logger.info(f"ef_dropout          : {args.ef_dropout}")
-        logger.info(f"ef_n_audio_queries  : {getattr(args, 'ef_n_audio_queries', 1)}")
-        logger.info(f"UNet seq length     : actual_T_a + 1 + 77 (actual_T_a = n_audio_queries if >0 else T_a)")
+        logger.info(f"UNet seq length     : T_a (full audio sequence, no resampler)")
         logger.info(f"cosine_loss         : {args.cosine_loss}")
         logger.info(f"trainable params    : {n_trainable:,}")
         logger.info(f"embeddings_dir      : {args.embeddings_dir}")
@@ -862,8 +860,8 @@ def train_validation():
                     nl  = noise_scheduler.add_noise(lats, nv, tv)
                     mp, fused_seq, audio_summary = model(af, iids, nl, tv)
                     # Pool for auxiliary losses:
-                    #   fused_pooled  — all tokens (audio + sep + text), for L1/L2 reg
-                    #   audio_pooled  — PRE-transformer audio tokens only, for cosine loss
+                    #   fused_pooled  — all audio tokens, for L1/L2 reg
+                    #   audio_pooled  — PRE-cross-attention audio tokens, for cosine loss
                     fused_pooled  = fused_seq.mean(dim=1)
                     audio_pooled  = audio_summary.mean(dim=1)
 
@@ -1013,9 +1011,9 @@ def train_validation():
                     audio_features, input_ids, noisy_latents, timesteps,
                 )
 
-                # Pool for auxiliary losses (UNet already received the full sequence).
-                # fused_pooled: all tokens (audio + sep + text), for optional L1/L2 reg
-                # audio_pooled: PRE-transformer audio tokens only, for cosine loss
+                # Pool for auxiliary losses (UNet already received the full audio sequence).
+                # fused_pooled: all audio tokens, for optional L1/L2 reg
+                # audio_pooled: PRE-cross-attention audio tokens, for cosine loss
                 fused_pooled = fused_seq.mean(dim=1)
                 audio_pooled = audio_summary.mean(dim=1)
 
@@ -1024,17 +1022,17 @@ def train_validation():
 
                 # [MUSIPAINTER-EQ3] L1 regularisation on e_audio (audio_pooled).
                 # Musipainter eq. (3): L = L_LDM + λ_a ‖e_audio‖₁ + λ_c · CL
-                # Using audio_pooled (PRE-transformer) ensures regularisation
-                # targets the pure audio embedding, not the text-fused one.
+                # Using audio_pooled (PRE-cross-attention) ensures regularisation
+                # targets the pure audio embedding, not the text-conditioned one.
                 _reg = args.lambda_a * torch.mean(torch.abs(audio_pooled))
                 if args.lambda_b > 0:
                     _reg = _reg + args.lambda_b * (torch.norm(audio_pooled, p=2, dim=1) ** 2).mean()
                 loss = loss + _reg
 
                 # [MUSIPAINTER-EQ2/5] Cosine alignment loss: aligns pure audio
-                # tokens (PRE-transformer) with the pre-normalised CLIP label l̂.
+                # tokens (PRE-cross-attention) with the pre-normalised CLIP label l̂.
                 # CL = (1 - <e_audio/‖e_audio‖, l̂>)²
-                # Using audio_pooled (PRE-transformer) is correct because l̂ is
+                # Using audio_pooled (PRE-cross-attention) is correct because l̂ is
                 # a CLIP text embedding — aligning a post-fusion (text-informed)
                 # audio vector against another text vector would collapse the
                 # audio modality into trivial text-text similarity.
@@ -1055,8 +1053,7 @@ def train_validation():
 
             scaler.scale(loss).backward()
 
-            if ((i + 1) % args.gradient_accumulation_steps == 0) or \
-               (i + 1 == len(train_dataloader)):
+            if ((i + 1) % args.gradient_accumulation_steps == 0) or (i + 1 == len(train_dataloader)):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 scaler.step(optimizer)
@@ -1107,7 +1104,7 @@ def train_validation():
                         base_model.early_fusion,
                         os.path.join(
                             args.output_dir,
-                            f"weights/{args.run_name}_early_fusion-step{global_step}.safetensors"
+                            f"weights/{args.run_name}_audio_guided_cross_attn-step{global_step}.safetensors"
                         )
                     )
                     if args.lora:
@@ -1154,7 +1151,7 @@ def train_validation():
                         best_vloss = _avg_v
                         _nb = os.path.join(
                             args.output_dir,
-                            f'best_model_early_fusion_{timestamp}.safetensors'
+                            f'best_model_audio_guided_cross_attn_{timestamp}.safetensors'
                         )
                         _nb_tmp = _nb + ".tmp"
                         from modules.preprocess.utils import save_safetensors as _sf_save
@@ -1162,13 +1159,12 @@ def train_validation():
                             _unwrap_compiled(base_model.early_fusion).state_dict(),
                             _nb_tmp
                         )
-                        if best_model_path and os.path.exists(best_model_path) \
-                                and best_model_path != _nb:
+                        if best_model_path and os.path.exists(best_model_path) and best_model_path != _nb:
                             os.remove(best_model_path)
                         os.replace(_nb_tmp, _nb)
                         if args.lora:
                             _nl = _nb.replace(
-                                'best_model_early_fusion_', 'best_model_lora_'
+                                'best_model_audio_guided_cross_attn_', 'best_model_lora_'
                             )
                             _nl_tmp = _nl + ".tmp"
                             _sf_save(base_model.lora_layers.state_dict(), _nl_tmp)
@@ -1224,7 +1220,7 @@ def train_validation():
                     best_vloss = avg_valid
                     _nb = os.path.join(
                         args.output_dir,
-                        f'best_model_early_fusion_{timestamp}.safetensors'
+                        f'best_model_audio_guided_cross_attn_{timestamp}.safetensors'
                     )
                     _nb_tmp = _nb + ".tmp"
                     from modules.preprocess.utils import save_safetensors as _sf_save_ep
@@ -1232,20 +1228,19 @@ def train_validation():
                         _unwrap_compiled(base_model.early_fusion).state_dict(),
                         _nb_tmp
                     )
-                    if best_model_path and os.path.exists(best_model_path) \
-                            and best_model_path != _nb:
+                    if best_model_path and os.path.exists(best_model_path) and best_model_path != _nb:
                         os.remove(best_model_path)
                     os.replace(_nb_tmp, _nb)
                     if args.lora:
                         _nl = _nb.replace(
-                            'best_model_early_fusion_', 'best_model_lora_'
+                            'best_model_audio_guided_cross_attn_', 'best_model_lora_'
                         )
                         _nl_tmp = _nl + ".tmp"
                         _sf_save_ep(base_model.lora_layers.state_dict(), _nl_tmp)
                         os.replace(_nl_tmp, _nl)
                     best_model_path = _nb
                     logger.info(
-                        f"  New best early_fusion: {_nb} (vloss={best_vloss:.4f})"
+                        f"  New best audio_guided_cross_attn: {_nb} (vloss={best_vloss:.4f})"
                     )
                 model.train()
                 base_model.unet.eval()
