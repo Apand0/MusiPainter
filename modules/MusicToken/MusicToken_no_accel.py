@@ -1,14 +1,14 @@
 # @title modules/MusicToken/MusicToken_no_accel.py
 """
-MusicToken_no_accel.py — Core model wrapper for Musipainter (v10, Audio Resampler).
+MusicToken_no_accel.py — Core model wrapper per Musipainter (Strada B).
 
-[AUDIO-RESAMPLER v10]
-EarlyFusionEncoder now uses an AudioResampler that compresses the full audio
-sequence [B, T_a, d_model] → [B, N_q, d_model] via learnable cross-attention
-queries, then fuses with text. The UNet receives
-[B, N_q + 1 + T_t, output_size] with N_q fixed (default 32), making the
-sequence length stride-agnostic. The +1 accounts for the FuseLIP separator
-token inserted between audio summary tokens and text tokens.
+[STRADA B — Early Fusion Continua]
+EarlyFusionEncoder usa Attentive Pooling che collassa la sequenza audio
+[B, T_a, d_model] → [B, 1, d_model], poi fonde con testo.
+La UNet riceve [B, actual_T_a + 1 + T_t, output_size] dove:
+    actual_T_a = n_audio_queries (se >0) altrimenti T_a
+    1   = FuseLIP separator token
+    T_t = 77 (CLIP text tokens)
 """
 
 import gc
@@ -111,30 +111,20 @@ class MusicTokenWrapper(nn.Module):
             gc.collect()
 
         # ── Dimensions ────────────────────────────────────────────────────────
-        audio_dim        = 768 * 3
-        output_size      = self.unet.config.cross_attention_dim
-        d_model          = getattr(args, 'ef_d_model',          512)
-        nhead            = getattr(args, 'ef_nhead',              8)
-        num_layers       = getattr(args, 'ef_num_layers',         4)
-        dropout          = getattr(args, 'ef_dropout',          0.1)
-        # [AUDIO-RESAMPLER v10] new args
-        n_audio_queries  = getattr(args, 'ef_n_audio_queries',   32)
-        resampler_heads  = getattr(args, 'ef_resampler_heads',    8)
-        resampler_layers = getattr(args, 'ef_resampler_layers',   2)
+        audio_dim = 768 * 3
+        output_size = self.unet.config.cross_attention_dim
+        d_model = getattr(args, 'ef_d_model', 512)
+        nhead = getattr(args, 'ef_nhead', 8)
+        num_layers = getattr(args, 'ef_num_layers', 4)
+        dropout = getattr(args, 'ef_dropout', 0.1)
+        n_audio_queries = getattr(args, 'ef_n_audio_queries', 1)
 
         logger.info(
-            f"EarlyFusionEncoder (v10-Resampler): "
+            f"EarlyFusionEncoder (Strada B — Flessibile): "
+            f"n_audio_queries={n_audio_queries} (0=Full, 1=Pooling, >1=Resampler), "
             f"audio_dim={audio_dim}, text_dim={self._text_dim}, "
             f"output_size={output_size}, d_model={d_model}, "
-            f"nhead={nhead}, num_layers={num_layers}, "
-            f"n_audio_queries={n_audio_queries}, "
-            f"resampler_heads={resampler_heads}, "
-            f"resampler_layers={resampler_layers}"
-        )
-        logger.info(
-            f"[RESAMPLER] Output sequence length = "
-            f"N_q({n_audio_queries}) + sep(1) + T_t(77) = {n_audio_queries + 1 + 77} tokens "
-            f"(stride-agnostic; was T_a+T_t per stride)"
+            f"nhead={nhead}, num_layers={num_layers}, dropout={dropout}"
         )
 
         # ── Trainable EarlyFusionEncoder ──────────────────────────────────────
@@ -147,8 +137,6 @@ class MusicTokenWrapper(nn.Module):
             num_layers=num_layers,
             dropout=dropout,
             n_audio_queries=n_audio_queries,
-            resampler_heads=resampler_heads,
-            resampler_layers=resampler_layers,
         )
         self.embedder = self.early_fusion  # alias for checkpoint helpers
 
@@ -268,9 +256,9 @@ class MusicTokenWrapper(nn.Module):
     def forward(
         self,
         audio_features: torch.Tensor,
-        input_ids:      torch.Tensor,
-        noisy_latents:  torch.Tensor,
-        timesteps:      torch.Tensor,
+        input_ids: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
     ):
         """
         Forward pass.
@@ -279,10 +267,7 @@ class MusicTokenWrapper(nn.Module):
           EarlyFusionEncoder acts as the domain-specific encoder τ_θ that maps
           the multimodal conditioning signal (audio + text) to a sequence
           τ_θ(y) ∈ R^{M×d_τ} fed to the UNet cross-attention layers as
-          encoder_hidden_states. The UNet then implements:
-            Attention(Q, K, V) with Q = W_Q · ϕ_i(z_t),
-                                     K = W_K · τ_θ(y),
-                                     V = W_V · τ_θ(y).
+          encoder_hidden_states.
 
         Args:
             audio_features : [B, T_a, 2304]    float32
@@ -292,22 +277,20 @@ class MusicTokenWrapper(nn.Module):
 
         Returns:
             model_pred     : [B, 4, H/8, W/8]  float32
-                             UNet noise/velocity prediction (LDM eq. 1/3).
+                             UNet noise/velocity prediction.
 
-            fused_seq      : [B, N_q + 1 + T_t, output_size]  float32
-                             Full fused sequence (audio summary + sep + text),
+            fused_seq      : [B, actual_T_a + 1 + T_t, output_size]  float32
+                             Full fused sequence (audio + sep + text),
                              post shared-Transformer and output_proj.
-                             Used for optional L1/L2 regularisation on the
-                             pooled representation.
 
-            audio_summary  : [B, N_q, output_size]  float32
-                             PRE-transformer audio summary tokens projected via
-                             loss_proj. Pure audio representation before
-                             cross-modal fusion with text. Used for the
+            audio_summary  : [B, 1, output_size]  float32
+                             PRE-transformer attentively-pooled audio token
+                             projected via loss_proj. Shape is always
+                             [B, 1, output_size] regardless of n_audio_queries
+                             routing mode, because AttentivePooling always
+                             collapses T_a → 1 before routing. Used for the
                              Musipainter cosine alignment loss (eq. 2/5):
-                               CL = (1 - <e_audio / ‖e_audio‖, l̂>)²
-                             where l̂ is the pre-normalised CLIP label vector
-                             (built in build_label_embedding_cache).
+                               CL = (1 - <e_audio / ||e_audio||, l_hat>)^2
         """
         text_tokens = self._get_text_embeddings(input_ids)  # [B, T_t, text_dim]
 
@@ -318,8 +301,8 @@ class MusicTokenWrapper(nn.Module):
         )
 
         # EarlyFusionEncoder returns:
-        #   fused_seq     : [B, N_q+1+T_t, output_size]  — for UNet + L1/L2 reg
-        #   audio_summary : [B, N_q, output_size]         — PRE-transformer,
+        #   fused_seq     : [B, actual_T_a + 1 + T_t, output_size]  — for UNet + L1/L2 reg
+        #   audio_summary : [B, 1, output_size]          — PRE-transformer,
         #                   for cosine loss (Musipainter eq. 2/5)
         fused_seq, audio_summary = self.early_fusion(
             audio_tokens=audio_feats,

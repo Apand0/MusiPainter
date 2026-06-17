@@ -7,17 +7,17 @@ frozen Stable Diffusion UNet. Audio embeddings are loaded via
 LazyEmbeddingIndex which accepts a comma-separated --embeddings_dir
 pointing to one or more Kaggle Dataset directories.
 
-[FIX-CFG-T_A] The unconditional embedding sequence length T_a is now
+[FIX-CFG-T_A] The unconditional embedding sequence length is now
 inferred dynamically from the first sample of the dataset instead of
-being hardcoded to 94. This ensures torch.cat([uncond, cond]) never
+being hardcoded. This ensures torch.cat([uncond, cond]) never
 fails with a size mismatch regardless of which temporal_pool_stride
 was used during preprocessing.
 
 Note on sequence lengths:
-  EarlyFusionEncoder outputs [B, N_q + 1 + T_t, output_size] where:
-    N_q = ef_n_audio_queries (default 32) — audio summary tokens
-    1   = FuseLIP separator token
-    T_t = 77                              — CLIP text tokens
+  EarlyFusionEncoder outputs [B, actual_T_a + 1 + T_t, output_size] where:
+  actual_T_a = n_audio_queries (if >0) or T_a (if 0)
+  1   = FuseLIP separator token
+  T_t = 77 — CLIP text tokens
   The +1 separator is handled internally by EarlyFusionEncoder and is
   transparent to the UNet, which simply attends over the full sequence
   as encoder_hidden_states (LDM Sec. 3.3).
@@ -122,17 +122,8 @@ def parse_args():
                         help="EarlyFusionEncoder number of Transformer layers.")
     parser.add_argument("--ef_dropout", type=float, default=0.1,
                         help="EarlyFusionEncoder dropout rate.")
-    # [AUDIO-RESAMPLER v10] new args — Audio Resampler
-    parser.add_argument("--ef_n_audio_queries", type=int, default=32,
-                        help="N_q: number of audio summary tokens produced by the "
-                             "AudioResampler. Output sequence to UNet = N_q + 1 + T_t "
-                             "(e.g. 32 + 1 + 77 = 110). Stride-agnostic.")
-    parser.add_argument("--ef_resampler_heads", type=int, default=8,
-                        help="Number of attention heads in the AudioResampler "
-                             "cross-attention blocks.")
-    parser.add_argument("--ef_resampler_layers", type=int, default=2,
-                        help="Number of stacked AudioResamplerBlock layers.")
-
+    parser.add_argument("--ef_n_audio_queries", type=int, default=1,
+                        help="0=Full T_a (FuseLIP), 1=AttentivePooling (MusiPainter, default), >1=Resampler")
     parser.add_argument(
         "--uncond_mode", type=str, default="zeros",
         choices=["zeros", "text_only"],
@@ -223,8 +214,8 @@ def _probe_audio_frame_count(dataset) -> int:
     the conditional one regardless of which temporal_pool_stride was used.
 
     Note: T_a is the number of BEATs frames in the precomputed embeddings,
-    NOT the output sequence length of EarlyFusionEncoder. The AudioResampler
-    compresses T_a → N_q internally; the UNet sees N_q + 1 + T_t tokens.
+    NOT the output sequence length of EarlyFusionEncoder. UNet directly 
+    processes actual_T_a + 1 + T_t tokens, preserving the full temporal resolution
     T_a is only needed here to size the silent audio tensor passed to
     EarlyFusionEncoder when building the unconditional CFG embedding.
 
@@ -264,9 +255,8 @@ def _build_uncond_embedding(
     where s = guidance_scale and ε_uncond is produced by this function.
 
     The silent audio tensor has shape [1, t_a, 2304] where t_a is inferred
-    dynamically from the dataset. The AudioResampler inside EarlyFusionEncoder
-    compresses t_a → N_q, so the output shape is always:
-        [1, N_q + 1 + T_t, output_size]
+    dynamically from the dataset. The output retains the audio's native dimensions, 
+    always resulting in: [1, actual_T_a + 1 + T_t, output_size]
     regardless of t_a. This matches the shape of the conditional embedding
     produced in the generation loop, ensuring torch.cat([uncond, cond]) always
     succeeds without a size mismatch.
@@ -280,7 +270,7 @@ def _build_uncond_embedding(
         device:       CUDA or CPU device.
 
     Returns:
-        uncond_embeddings: [1, N_q + 1 + T_t, output_size] float tensor.
+        uncond_embeddings: [1, actual_T_a + 1 + T_t, output_size] float tensor.
     """
     audio_dim     = 768 * 3          # BEATs layers 4+8+12 concatenated
     silent_audio  = torch.zeros(1, t_a, audio_dim, dtype=weight_dtype, device=device)
@@ -301,7 +291,7 @@ def _build_uncond_embedding(
             uncond_embeddings = base_model.early_fusion(
                 audio_tokens=silent_audio,
                 text_tokens=uncond_text,
-            )   # [1, N_q+1+T_t, output_size]
+            )   # [1, actual_T_a+1+T_t, output_size]
 
             logger.info(
                 f"[CFG] uncond_mode=zeros | "
@@ -328,7 +318,7 @@ def _build_uncond_embedding(
             uncond_embeddings = base_model.early_fusion(
                 audio_tokens=silent_audio,
                 text_tokens=uncond_text,
-            )   # [1, N_q+1+T_t, output_size]
+            )   # [1, actual_T_a+1+T_t, output_size]
 
             logger.info(
                 f"[CFG] uncond_mode=text_only | "
@@ -368,6 +358,14 @@ def inference(args):
         if _n_gpus > 0 else "CPU"
     )
 
+    _n_q = getattr(args, 'ef_n_audio_queries', 1)
+    _seq_desc = (
+        f"T_a + 1 + 77 (Full Temporal Resolution)"
+        if _n_q == 0 else
+        f"{_n_q} + 1 + 77 (Resampler)" if _n_q > 1 else
+        f"1 + 1 + 77 (AttentivePooling)"
+    )
+
     logger.info("=" * 60)
     logger.info("START: INFERENCE — Early Fusion branch")
     logger.info(f"timestamp           : {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -383,11 +381,8 @@ def inference(args):
     logger.info(f"ef_nhead            : {args.ef_nhead}")
     logger.info(f"ef_num_layers       : {args.ef_num_layers}")
     logger.info(f"ef_dropout          : {args.ef_dropout}")
-    logger.info(f"ef_n_audio_queries  : {args.ef_n_audio_queries}")
-    logger.info(f"ef_resampler_heads  : {args.ef_resampler_heads}")
-    logger.info(f"ef_resampler_layers : {args.ef_resampler_layers}")
-    logger.info(f"UNet seq length     : {args.ef_n_audio_queries + 1 + 77} tokens "
-                f"(N_q={args.ef_n_audio_queries} + sep=1 + T_t=77)")
+    logger.info(f"ef_n_audio_queries  : {_n_q}")
+    logger.info(f"UNet seq length     : {_seq_desc}")
     logger.info(f"embeddings_dir      : {args.embeddings_dir}")
     logger.info(f"embeddings_preload  : {args.embeddings_preload_all}")
     logger.info(f"learned_embeds      : {args.learned_embeds}")
@@ -457,14 +452,11 @@ def inference(args):
     # ── Dynamic T_a probe ─────────────────────────────────────────────────────
     # [FIX-CFG-T_A] Read the actual BEATs frame count from the first dataset
     # sample. This is needed only to size the silent audio tensor for the
-    # unconditional CFG embedding; the AudioResampler will compress it to N_q
-    # internally, so the UNet always sees N_q+1+T_t tokens regardless of T_a.
+    # unconditional CFG embedding; the EarlyFusionEncoder will compress it
+    # internally based on n_audio_queries, so the UNet always sees actual_T_a+1+T_t tokens.
     t_a: int = _probe_audio_frame_count(test_dataset)
 
     # ── Unconditional embedding for CFG (built once, reused for all samples) ──
-    # EarlyFusionEncoder compresses T_a → N_q via the AudioResampler, so both
-    # uncond and cond embeddings have shape [1, N_q+1+T_t, output_size].
-    # torch.cat([uncond, cond]) is therefore always safe regardless of T_a.
     uncond_embeddings = _build_uncond_embedding(
         args=args,
         base_model=base_model,
@@ -520,19 +512,19 @@ def inference(args):
 
         with torch.no_grad():
             # ── Conditional embedding (audio + text fused) ────────────────────
-            # EarlyFusionEncoder: τ_θ(audio, text) → [1, N_q+1+T_t, output_size]
+            # EarlyFusionEncoder: τ_θ(audio, text) → [1, actual_T_a+1+T_t, output_size]
             text_tokens = base_model._get_text_embeddings(cond_input_ids).to(weight_dtype)
             cond_embeddings = base_model.early_fusion(
                 audio_tokens=aud_features,
                 text_tokens=text_tokens,
-            )   # [1, N_q+1+T_t, output_size]
+            )   # [1, actual_T_a+1+T_t, output_size]
 
             # CFG (LDM Sec. 4 / Ho & Salimans 2022):
-            # stack uncond + cond → [2, N_q+1+T_t, output_size]
+            # stack uncond + cond → [2, actual_T_a+1+T_t, output_size]
             # Both tensors have the same sequence length because the
-            # AudioResampler outputs N_q tokens regardless of T_a.
+            # EarlyFusionEncoder uses the same n_audio_queries for both.
             text_embeddings = torch.cat([uncond_embeddings, cond_embeddings])
-            # [2, N_q+1+T_t, output_size]
+            # [2, actual_T_a+1+T_t, output_size]
 
             # ── Latent diffusion (LDM Sec. 3.2) ──────────────────────────────
             seed = random.randint(0, 10000)

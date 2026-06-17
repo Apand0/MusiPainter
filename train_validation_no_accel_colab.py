@@ -440,15 +440,8 @@ def parse_args():
                         help="EarlyFusionEncoder number of Transformer layers.")
     parser.add_argument("--ef_dropout", type=float, default=0.1,
                         help="EarlyFusionEncoder dropout rate.")
-    # [AUDIO-RESAMPLER v10] new args — Audio Resampler
-    parser.add_argument("--ef_n_audio_queries", type=int, default=32,
-                        help="N_q: number of audio summary tokens produced by the "
-                             "AudioResampler. Output sequence to UNet = N_q + 1 + T_t ")
-    parser.add_argument("--ef_resampler_heads", type=int, default=8,
-                        help="Number of attention heads in the AudioResampler "
-                             "cross-attention blocks.")
-    parser.add_argument("--ef_resampler_layers", type=int, default=2,
-                        help="Number of stacked AudioResamplerBlock layers.")
+    parser.add_argument("--ef_n_audio_queries", type=int, default=1,
+                        help="0=Full T_a (FuseLIP), 1=AttentivePooling (MusiPainter, default), >1=Resampler")
 
     args = parser.parse_args()
 
@@ -826,11 +819,8 @@ def train_validation():
         logger.info(f"ef_nhead            : {args.ef_nhead}")
         logger.info(f"ef_num_layers       : {args.ef_num_layers}")
         logger.info(f"ef_dropout          : {args.ef_dropout}")
-        logger.info(f"ef_n_audio_queries  : {args.ef_n_audio_queries}")
-        logger.info(f"ef_resampler_heads  : {args.ef_resampler_heads}")
-        logger.info(f"ef_resampler_layers : {args.ef_resampler_layers}")
-        logger.info(f"UNet seq length     : {args.ef_n_audio_queries + 1 + 77} tokens "
-                    f"(N_q={args.ef_n_audio_queries} + sep=1 + T_t=77)")
+        logger.info(f"ef_n_audio_queries  : {getattr(args, 'ef_n_audio_queries', 1)}")
+        logger.info(f"UNet seq length     : actual_T_a + 1 + 77 (actual_T_a = n_audio_queries if >0 else T_a)")
         logger.info(f"cosine_loss         : {args.cosine_loss}")
         logger.info(f"trainable params    : {n_trainable:,}")
         logger.info(f"embeddings_dir      : {args.embeddings_dir}")
