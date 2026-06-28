@@ -1,10 +1,6 @@
 # @title train_validation_no_accel_colab.py
-"""DDP Training & Validation for Musipainter (Audio-Guided Cross-Attention branch).
-
-Supports single-GPU and multi-GPU (torchrun) modes.
-Audio embeddings are loaded via LazyEmbeddingIndex which accepts a
-comma-separated --embeddings_dir pointing to one or more Kaggle Dataset
-directories (per-class chunks, merged safetensors, or legacy .pt).
+"""
+DDP Training & Validation for Musipainter (Audio-Guided Cross-Attention branch).
 """
 
 import argparse
@@ -141,12 +137,19 @@ def save_progress(module, save_path):
 
 
 def save_checkpoint(embedder, optimizer, scaler, lr_scheduler, global_step,
-                    best_vloss, lora_layers, save_path, best_model_path=None):
+                    best_vloss, lora_layers, save_path, best_model_path=None,
+                    base_model=None):
+    # FIX Bug-C: save full trainable state (early_fusion + resampler),
+    # not just early_fusion. base_model is the MusicTokenWrapper instance.
+    if base_model is not None:
+        embedder_state = base_model.trainable_state_dict()
+    else:
+        embedder_state = _unwrap_compiled(embedder).state_dict()
     ckpt = {
         "global_step":             global_step,
         "best_vloss":              best_vloss,
         "best_model_path":         best_model_path,
-        "embedder_state_dict":     _unwrap_compiled(embedder).state_dict(),
+        "embedder_state_dict":     embedder_state,
         "optimizer_state_dict":    optimizer.state_dict(),
         "scaler_state_dict":       scaler.state_dict(),
         "lr_scheduler_state_dict": lr_scheduler.state_dict(),
@@ -160,14 +163,28 @@ def save_checkpoint(embedder, optimizer, scaler, lr_scheduler, global_step,
 
 
 def load_checkpoint(resume_path, embedder, optimizer, scaler, lr_scheduler,
-                    lora_layers, device):
+                    lora_layers, device, base_model=None):
     if not os.path.exists(resume_path):
         logger.warning(f"[RESUME] Checkpoint not found: {resume_path}. "
                        "Training starts from scratch.")
         return 0, float('inf'), None
     logger.info(f"[RESUME] Loading checkpoint: {resume_path}")
     ckpt = torch.load(resume_path, map_location=device)
-    _unwrap_compiled(embedder).load_state_dict(ckpt["embedder_state_dict"])
+    # FIX: new checkpoints store full trainable_state_dict (early_fusion + resampler).
+    # Use base_model.load_trainable_state_dict if available, otherwise fall back
+    # to loading only into early_fusion (old checkpoint format).
+    if base_model is not None:
+        missing, unexpected = base_model.load_trainable_state_dict(
+            ckpt["embedder_state_dict"]
+        )
+        if missing:
+            logger.warning(f"[RESUME] Missing keys: {missing[:5]}")
+        if unexpected:
+            logger.warning(f"[RESUME] Unexpected keys: {unexpected[:5]}")
+    else:
+        _unwrap_compiled(embedder).load_state_dict(
+            ckpt["embedder_state_dict"], strict=False
+        )
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     scaler.load_state_dict(ckpt["scaler_state_dict"])
     lr_scheduler.load_state_dict(ckpt["lr_scheduler_state_dict"])
@@ -204,11 +221,13 @@ def load_embedder_weights(weight_path, embedder, device, resume_step: int = 0):
         state_dict = load_safetensors(resolved, device=str(device))
     else:
         state_dict = torch.load(resolved, map_location=device, weights_only=True)
-    missing, unexpected = _unwrap_compiled(embedder).load_state_dict(state_dict, strict=True)
+    missing, unexpected = _unwrap_compiled(embedder).load_state_dict(
+        state_dict, strict=False
+    )
     if missing:
-        logger.warning(f"[RESUME-WEIGHTS] Missing keys: {missing}")
+        logger.warning(f"[RESUME-WEIGHTS] Missing keys (may be resampler — ok for new arch): {missing[:5]}")
     if unexpected:
-        logger.warning(f"[RESUME-WEIGHTS] Unexpected keys: {unexpected}")
+        logger.warning(f"[RESUME-WEIGHTS] Unexpected keys: {unexpected[:5]}")
     logger.info(f"[RESUME-WEIGHTS] FullAudioGuidedCrossAttentionEncoder loaded (resume_step={resume_step})")
     return resume_step, float('inf')
 
@@ -668,9 +687,14 @@ def train_validation():
     base_model = model.module if isinstance(model, DDP) else model
 
     # ── Optimiser ─────────────────────────────────────────────────────────────
-    trainable_params = list(
-        _unwrap_compiled(base_model.early_fusion).parameters()
-    )
+    # FIX: include the sequence resampler (T_a → 77) in trainable params
+    _ef = _unwrap_compiled(base_model.early_fusion)
+    trainable_params = list(_ef.parameters())
+    trainable_params += list(base_model.seq_resampler.parameters())
+    trainable_params += [base_model.resampler_queries]
+    trainable_params += list(base_model.resampler_attn.parameters())
+    trainable_params += list(base_model.resampler_norm.parameters())
+    trainable_params += list(base_model.loss_proj_head.parameters())
     if args.lora:
         trainable_params += list(base_model.lora_layers.parameters())
 
@@ -723,6 +747,7 @@ def train_validation():
                 optimizer, scaler, lr_scheduler,
                 base_model.lora_layers if args.lora else None,
                 device,
+                base_model=base_model,
             )
             best_model_path = _resumed_best
         if is_ddp:
@@ -732,7 +757,15 @@ def train_validation():
             dist.broadcast(_bv, src=0)
             global_step = _gs.item()
             best_vloss  = _bv.item()
+            # FIX: broadcast ALL trainable params (early_fusion + resampler)
             for param in _unwrap_compiled(base_model.early_fusion).parameters():
+                dist.broadcast(param.data, src=0)
+            for param in base_model.seq_resampler.parameters():
+                dist.broadcast(param.data, src=0)
+            dist.broadcast(base_model.resampler_queries.data, src=0)
+            for param in base_model.resampler_attn.parameters():
+                dist.broadcast(param.data, src=0)
+            for param in base_model.resampler_norm.parameters():
                 dist.broadcast(param.data, src=0)
 
     if args.resume_from_embedder and not args.resume_from_checkpoint:
@@ -747,7 +780,15 @@ def train_validation():
             _gs = torch.tensor([global_step], dtype=torch.long, device=device)
             dist.broadcast(_gs, src=0)
             global_step = _gs.item()
+            # FIX: broadcast ALL trainable params
             for param in _unwrap_compiled(base_model.early_fusion).parameters():
+                dist.broadcast(param.data, src=0)
+            for param in base_model.seq_resampler.parameters():
+                dist.broadcast(param.data, src=0)
+            dist.broadcast(base_model.resampler_queries.data, src=0)
+            for param in base_model.resampler_attn.parameters():
+                dist.broadcast(param.data, src=0)
+            for param in base_model.resampler_norm.parameters():
                 dist.broadcast(param.data, src=0)
 
     # ── Validation dataloader ─────────────────────────────────────────────────
@@ -1100,13 +1141,12 @@ def train_validation():
                     f"weights/checkpoint_step{global_step}.pt"
                 )
                 if _ckpt_path not in resume_ckpt_paths:
-                    save_progress(
-                        base_model.early_fusion,
-                        os.path.join(
-                            args.output_dir,
-                            f"weights/{args.run_name}_audio_guided_cross_attn-step{global_step}.safetensors"
-                        )
+                    _ckpt_weights_path = os.path.join(
+                        args.output_dir,
+                        f"weights/{args.run_name}_audio_guided_cross_attn-step{global_step}.safetensors"
                     )
+                    from modules.preprocess.utils import save_safetensors as _sf_save_step
+                    _sf_save_step(base_model.trainable_state_dict(), _ckpt_weights_path)
                     if args.lora:
                         save_progress(
                             base_model.lora_layers,
@@ -1125,6 +1165,7 @@ def train_validation():
                         lora_layers=base_model.lora_layers if args.lora else None,
                         save_path=_ckpt_path,
                         best_model_path=best_model_path,
+                        base_model=base_model,
                     )
                     resume_ckpt_paths.append(_ckpt_path)
                     _rotate_checkpoints(resume_ckpt_paths, args.keep_last_n_checkpoints)
@@ -1155,8 +1196,9 @@ def train_validation():
                         )
                         _nb_tmp = _nb + ".tmp"
                         from modules.preprocess.utils import save_safetensors as _sf_save
+                        # FIX Bug-A: save full trainable state (early_fusion + resampler)
                         _sf_save(
-                            _unwrap_compiled(base_model.early_fusion).state_dict(),
+                            base_model.trainable_state_dict(),
                             _nb_tmp
                         )
                         if best_model_path and os.path.exists(best_model_path) and best_model_path != _nb:
@@ -1224,8 +1266,9 @@ def train_validation():
                     )
                     _nb_tmp = _nb + ".tmp"
                     from modules.preprocess.utils import save_safetensors as _sf_save_ep
+                    # FIX Bug-B: save full trainable state (early_fusion + resampler)
                     _sf_save_ep(
-                        _unwrap_compiled(base_model.early_fusion).state_dict(),
+                        base_model.trainable_state_dict(),
                         _nb_tmp
                     )
                     if best_model_path and os.path.exists(best_model_path) and best_model_path != _nb:
@@ -1260,8 +1303,9 @@ def train_validation():
 
     # ── Final save ────────────────────────────────────────────────────────────
     if is_main:
-        save_progress(
-            base_model.early_fusion,
+        from modules.preprocess.utils import save_safetensors as _sf_final
+        _sf_final(
+            base_model.trainable_state_dict(),
             os.path.join(args.output_dir, "learned_embeds.safetensors")
         )
         if args.lora:

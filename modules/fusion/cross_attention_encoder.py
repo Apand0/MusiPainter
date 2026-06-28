@@ -2,34 +2,6 @@
 """
 cross_attention_encoder.py — Asymmetric Audio-Guided Cross-Attention encoder
 for the Musipainter pipeline.
-
-Design rationale
-----------------
-The text conditions the audio, NOT the other way round.
-Q = Audio tokens  →  the sequence whose content we want to enrich.
-K = V = Text tokens  →  the conditioning source.
-
-This follows the cross-attention formulation in "Attention Is All You Need"
-(Vaswani et al., Sec. 3.2) and mirrors the role of τ_θ in Latent Diffusion
-Models (Rombach et al., Sec. 3.3): a domain-specific encoder that maps the
-conditioning signal y to a sequence τ_θ(y) ∈ R^{M×d_τ} passed as
-encoder_hidden_states to the UNet cross-attention layers.
-
-No Audio Resampler is used here: the full temporal audio sequence [B, T_a, D]
-is preserved and conditioned by text at every time step.  The output shape
-[B, T_a, output_size] is stride-dependent (T_a varies with temporal_pool_stride)
-but the UNet cross-attention is position-agnostic and accepts any sequence
-length, so this is not a problem.
-
-Text positional encoding
-------------------------
-Text tokens enter already carrying CLIP positional embeddings (they come from
-`token_embedding` in MusicTokenWrapper._get_text_embeddings, which is the raw
-nn.Embedding from the frozen CLIP text encoder).  We therefore do NOT add a
-second positional table for text inside this encoder — it would double-count
-positions and corrupt the CLIP embedding space.  Only audio receives its own
-positional table because audio embeddings are raw BEATs features with no
-inherent positional encoding.
 """
 
 import torch
