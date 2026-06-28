@@ -1,21 +1,6 @@
 # @title modules/fusion/early_fusion_encoder.py
 """
 early_fusion_encoder.py — Early-Fusion multimodal encoder for Musipainter (Strada B).
-
-[STRADA B — Continuous Early Fusion]
-- Audio: continuous features from BEATs (concatenation of layers 4, 8, 12).
-- Audio projection: 2-layer MLP with GELU (Musipainter Section 3.3).
-- Pooling: Attentive Pooling that collapses to 1 token (Musipainter Section 3.3).
-- Fusion: FuseLIP-style early fusion by concatenation of continuous sequences.
-- Transformer: shared encoder with bidirectional self-attention (AIAYN).
-- Dynamic routing: n_audio_queries controls the temporal resolution sent to the UNet:
-    0  → full audio sequence T_a tokens (pure FuseLIP)
-    1  → single attentively-pooled token (pure Musipainter, default)
-    >1 → Perceiver-style resampler producing N summary tokens
-
-The cosine alignment loss (Musipainter eq. 2/5) always uses the attentively-pooled
-token (audio_summary, shape [B, 1, output_size]) regardless of the routing mode,
-because it must represent the pure audio modality before cross-modal fusion with text.
 """
 
 import torch

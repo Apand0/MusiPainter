@@ -1,10 +1,6 @@
 # @title train_validation_no_accel_colab.py
-"""DDP Training & Validation for Musipainter (Early Fusion branch).
-
-Supports single-GPU and multi-GPU (torchrun) modes.
-Audio embeddings are loaded via LazyEmbeddingIndex which accepts a
-comma-separated --embeddings_dir pointing to one or more Kaggle Dataset
-directories (per-class chunks, merged safetensors, or legacy .pt).
+"""
+DDP Training & Validation per Musipainter (Branch FuseLIP / Early Fusion).
 """
 
 import argparse
@@ -177,15 +173,15 @@ def load_checkpoint(resume_path, embedder, optimizer, scaler, lr_scheduler,
     best_vloss      = ckpt.get("best_vloss", float('inf'))
     best_model_path = ckpt.get("best_model_path", None)
     if best_model_path is not None and not os.path.exists(best_model_path):
-        logger.warning(f"[RESUME] best_model_path not found on disk: {best_model_path}.")
+        logger.warning(f"[RESUME] best_model_path non trovato su disco: {best_model_path}.")
         best_model_path = None
-    _arch = ckpt.get("arch", "late_fusion_v8")
+    _arch = ckpt.get("arch", "early_fusion_v9")
     if _arch != "early_fusion_v9":
         logger.warning(
-            f"[RESUME] Checkpoint arch='{_arch}' — was trained with Late Fusion. "
-            "Weights may not be compatible with EarlyFusionEncoder."
+            f"[RESUME] Checkpoint arch='{_arch}' — addestrato con architettura diversa. "
+            "I pesi potrebbero non essere compatibili con EarlyFusionEncoder."
         )
-    logger.info(f"[RESUME] Resuming from step={global_step}, best_vloss={best_vloss:.4f}.")
+    logger.info(f"[RESUME] Ripresa da step={global_step}, best_vloss={best_vloss:.4f}.")
     return global_step, best_vloss, best_model_path
 
 
@@ -194,10 +190,10 @@ def load_embedder_weights(weight_path, embedder, device, resume_step: int = 0):
     if not os.path.exists(resolved) and resolved.endswith(".bin"):
         sf_candidate = resolved[:-4] + ".safetensors"
         if os.path.exists(sf_candidate):
-            logger.info(f"[RESUME-WEIGHTS] .bin not found, using .safetensors: {sf_candidate}")
+            logger.info(f"[RESUME-WEIGHTS] .bin non trovato, usando .safetensors: {sf_candidate}")
             resolved = sf_candidate
     if not os.path.exists(resolved):
-        raise FileNotFoundError(f"[RESUME-WEIGHTS] Weight file not found: {resolved}")
+        raise FileNotFoundError(f"[RESUME-WEIGHTS] File pesi non trovato: {resolved}")
     logger.info(f"[RESUME-WEIGHTS] Loading embedder weights from: {resolved}")
     if resolved.endswith(".safetensors"):
         from modules.preprocess.utils import load_safetensors
@@ -209,24 +205,20 @@ def load_embedder_weights(weight_path, embedder, device, resume_step: int = 0):
         logger.warning(f"[RESUME-WEIGHTS] Missing keys: {missing}")
     if unexpected:
         logger.warning(f"[RESUME-WEIGHTS] Unexpected keys: {unexpected}")
-    logger.info(f"[RESUME-WEIGHTS] EarlyFusionEncoder loaded (resume_step={resume_step})")
+    logger.info(f"[RESUME-WEIGHTS] EarlyFusionEncoder caricato (resume_step={resume_step})")
     return resume_step, float('inf')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LABEL EMBEDDING CACHE  (Early Fusion version)
+#  LABEL EMBEDDING CACHE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_label_embedding_cache(tokenizer, token_embedding, all_labels, device):
     """
-    Pre-compute cosine-loss target vectors for each unique art style label.
+    Pre-calcola i vettori target per la cosine loss per ogni label unico.
 
-    Uses base_model.token_embedding (frozen CLIP nn.Embedding) directly.
-    Semantics: mean of CLIP token embeddings for label words (excluding BOS/EOS),
-    then L2-normalised to produce l̂ as per Musipainter eq. (2/5).
-
-    Pre-normalising here avoids redundant normalisation on every training step
-    and ensures the stored matrix already satisfies ‖l̂‖ = 1.
+    Media degli embedding CLIP per le parole del label (esclusi BOS/EOS),
+    poi normalizzata L2 per produrre l̂ come da Musipainter eq. (2/5).
     """
     label_list = sorted(set(all_labels))
     vecs = []
@@ -238,7 +230,6 @@ def build_label_embedding_cache(tokenizer, token_embedding, all_labels, device):
         ids_t = torch.tensor(ids, device=device)
         with torch.no_grad():
             vec = token_embedding(ids_t).float().mean(dim=0).detach()
-            # [MUSIPAINTER-EQ2/5] Pre-normalise l̂ as in the paper
             vec = F.normalize(vec.unsqueeze(0), dim=1).squeeze(0)
         vecs.append(vec)
         valid_labels.append(label)
@@ -246,8 +237,8 @@ def build_label_embedding_cache(tokenizer, token_embedding, all_labels, device):
     label_matrix = torch.stack(vecs).to(device)
     label_to_idx = {lbl: i for i, lbl in enumerate(valid_labels)}
     logger.info(
-        f"Label cache: {len(valid_labels)} unique labels, "
-        f"matrix {list(label_matrix.shape)} on {device}"
+        f"Label cache: {len(valid_labels)} label unici, "
+        f"matrix {list(label_matrix.shape)} su {device}"
     )
     return label_list, label_to_idx, label_matrix
 
@@ -266,7 +257,6 @@ def precompute_vae_latents(vae, dataloader, device, use_amp):
             pixel_values = batch["pixel_values"].to(device, non_blocking=True)
             image_ids    = batch["image_id"]
             with autocast(enabled=use_amp):
-                # LDM Sec. 3.1: z = E(x) * scaling_factor
                 latents = vae.encode(
                     pixel_values.to(dtype=torch.float16)
                 ).latent_dist.sample() * 0.18215
@@ -278,7 +268,7 @@ def precompute_vae_latents(vae, dataloader, device, use_amp):
         sample = next(iter(cache.values()))
         size_mb = sample.numel() * sample.element_size() * n / (1024 ** 2)
         logger.info(
-            f"VAE latent cache: {n} images, shape={list(sample.shape)}, "
+            f"VAE latent cache: {n} immagini, shape={list(sample.shape)}, "
             f"~{size_mb:.0f} MB (float16)"
         )
     return cache
@@ -306,8 +296,8 @@ def _check_tb_size(writer, tb_dir: str, max_mb: int):
     size_mb = _dir_size_mb(tb_dir)
     if size_mb > max_mb:
         logger.warning(
-            f"TensorBoard runs/ uses {size_mb:.0f} MB > {max_mb} MB. "
-            "Clearing and reopening writer."
+            f"TensorBoard runs/ usa {size_mb:.0f} MB > {max_mb} MB. "
+            "Pulizia e riapertura writer."
         )
         writer.close()
         import shutil
@@ -327,7 +317,7 @@ def _rotate_checkpoints(ckpt_paths: list, keep_n: int):
         old = ckpt_paths.pop(0)
         if os.path.exists(old):
             os.remove(old)
-            logger.info(f"[RESUME] Old checkpoint removed: {old}")
+            logger.info(f"[RESUME] Vecchio checkpoint rimosso: {old}")
 
 
 def _check_disk_space(output_dir: str, warn_gb: float = 1.0, critical_gb: float = 0.3):
@@ -340,20 +330,20 @@ def _check_disk_space(output_dir: str, warn_gb: float = 1.0, critical_gb: float 
         working_dir_mb = _dir_size_mb(output_dir)
         if free_gb < critical_gb:
             logger.error(
-                f"[DISK-CRITICAL] {free_gb:.2f} GB free / {total_gb:.1f} GB total. "
-                f"Output dir: {working_dir_mb:.0f} MB. CRASH RISK."
+                f"[DISK-CRITICAL] {free_gb:.2f} GB liberi / {total_gb:.1f} GB totali. "
+                f"Output dir: {working_dir_mb:.0f} MB. RISCHIO CRASH."
             )
         elif free_gb < warn_gb:
             logger.warning(
-                f"[DISK-WARN] {free_gb:.2f} GB free ({used_gb:.1f}/{total_gb:.1f} GB)."
+                f"[DISK-WARN] {free_gb:.2f} GB liberi ({used_gb:.1f}/{total_gb:.1f} GB)."
             )
         else:
             logger.info(
-                f"[DISK-OK] {free_gb:.2f} GB free. Output dir: {working_dir_mb:.0f} MB."
+                f"[DISK-OK] {free_gb:.2f} GB liberi. Output dir: {working_dir_mb:.0f} MB."
             )
         return free_gb
     except Exception as e:
-        logger.warning(f"[DISK-MONITOR] Unable to read disk space: {e}")
+        logger.warning(f"[DISK-MONITOR] Impossibile leggere spazio disco: {e}")
         return None
 
 
@@ -389,7 +379,7 @@ def parse_args():
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--max_train_steps", type=int, default=20000)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)  # [FIX-BUG1] era 1
     parser.add_argument("--learning_rate", type=float, default=1e-05)
     parser.add_argument("--scale_lr", type=_str2bool, default=False)
     parser.add_argument("--lr_scheduler", type=str, default="constant")
@@ -412,7 +402,8 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default='MusicToken')
     parser.add_argument("--cosine_loss", type=_str2bool, default=True)
     parser.add_argument("--input_length", type=int, default=30)
-    parser.add_argument("--train_batch_size", type=int, default=8)
+    # [FIX-BUG1] default abbassato da 8 a 2 per evitare OOM su T4 (15 GB)
+    parser.add_argument("--train_batch_size", type=int, default=2)
     parser.add_argument("--validation_batch_size", type=int, default=4)
     parser.add_argument("--lora", type=_str2bool, default=False)
     parser.add_argument("--revision", type=str, default=None, required=False)
@@ -432,16 +423,12 @@ def parse_args():
     parser.add_argument("--latents_dir", type=str, default="./image_latents/")
 
     # ── Early Fusion hyper-parameters ────────────────────────────────────────
-    parser.add_argument("--ef_d_model", type=int, default=512,
-                        help="EarlyFusionEncoder shared Transformer hidden dim.")
-    parser.add_argument("--ef_nhead", type=int, default=8,
-                        help="EarlyFusionEncoder number of attention heads.")
-    parser.add_argument("--ef_num_layers", type=int, default=4,
-                        help="EarlyFusionEncoder number of Transformer layers.")
-    parser.add_argument("--ef_dropout", type=float, default=0.1,
-                        help="EarlyFusionEncoder dropout rate.")
+    parser.add_argument("--ef_d_model", type=int, default=512)
+    parser.add_argument("--ef_nhead", type=int, default=8)
+    parser.add_argument("--ef_num_layers", type=int, default=4)
+    parser.add_argument("--ef_dropout", type=float, default=0.1)
     parser.add_argument("--ef_n_audio_queries", type=int, default=1,
-                        help="0=Full T_a (FuseLIP), 1=AttentivePooling (MusiPainter, default), >1=Resampler")
+                        help="0=Full T_a (FuseLIP), 1=AttentivePooling (default), >1=Resampler")
 
     args = parser.parse_args()
 
@@ -450,7 +437,7 @@ def parse_args():
         args.local_rank = env_local_rank
 
     if args.data_dir is None:
-        raise ValueError("Specify --data_dir.")
+        raise ValueError("Specificare --data_dir.")
 
     args.image_latents_dir = args.latents_dir
     return args
@@ -475,7 +462,7 @@ def train_validation():
     if is_main:
         _n_gpus = torch.cuda.device_count()
         print(f"\n{'='*60}")
-        print(f"  Musipainter — Early Fusion")
+        print(f"  Musipainter — FuseLIP / Early Fusion")
         print(f"  GPUs available    : {_n_gpus}")
         mode_str = f"DDP ({world_size}x GPU)" if is_ddp else "Single GPU"
         print(f"  Mode              : {mode_str}")
@@ -501,19 +488,16 @@ def train_validation():
 
     # ── Tokenizer + noise scheduler ──────────────────────────────────────────
     if args.tokenizer_name:
-        tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name,
-                                                  cache_dir=_hf_cache)
+        tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name, cache_dir=_hf_cache)
     else:
         tokenizer = CLIPTokenizer.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="tokenizer",
             cache_dir=_hf_cache,
         )
 
-    # Early Fusion: no placeholder injection into CLIP.
-    # The tokenizer is used only to convert text labels/prompts to token IDs.
     logger.info(
-        "Tokenizer loaded — Early Fusion mode: "
-        "no <*> injection into CLIP text encoder."
+        "Tokenizer caricato — FuseLIP / Early Fusion mode: "
+        "no <*> injection nel CLIP text encoder."
     )
 
     noise_scheduler = DDPMScheduler.from_pretrained(
@@ -588,7 +572,7 @@ def train_validation():
     model = MusicTokenWrapper(args)
     base_model = model
 
-    # ── VAE precompute ─────────────────────────────────────────────────────────
+    # ── VAE precompute ────────────────────────────────────────────────────────
     train_latent_cache = {}
     valid_latent_cache = {}
 
@@ -601,9 +585,7 @@ def train_validation():
             train_latent_cache = None
             valid_latent_cache = None
             if is_main:
-                logger.info(
-                    "[PREIMG] latents_dir provided → LazyLatentIndex active."
-                )
+                logger.info("[PREIMG] latents_dir fornita → LazyLatentIndex attivo.")
         else:
             if is_main:
                 precompute_train_loader = torch.utils.data.DataLoader(
@@ -635,21 +617,21 @@ def train_validation():
         try:
             base_model.unet.enable_gradient_checkpointing()
             if is_main:
-                logger.info("UNet gradient checkpointing enabled")
+                logger.info("UNet gradient checkpointing abilitato da flag CLI")
         except Exception as e:
             if is_main:
-                logger.warning(f"Gradient checkpointing unavailable: {e}")
+                logger.warning(f"Gradient checkpointing non disponibile: {e}")
 
     model = model.to(device)
 
-    # torch.compile on EarlyFusionEncoder
+    # torch.compile su EarlyFusionEncoder
     try:
         base_model.early_fusion = torch.compile(
             base_model.early_fusion, mode="default", fullgraph=False
         )
         base_model.embedder = base_model.early_fusion
         if is_main:
-            logger.info("EarlyFusionEncoder compiled.")
+            logger.info("EarlyFusionEncoder compiled con torch.compile.")
     except Exception as e:
         if is_main:
             logger.info(f"torch.compile skipped: {e}")
@@ -669,10 +651,11 @@ def train_validation():
     base_model = model.module if isinstance(model, DDP) else model
 
     # ── Optimiser ─────────────────────────────────────────────────────────────
+    # [FIX-BUG2] trainable_params include esplicitamente lora_layers quando attivo
     trainable_params = list(
         _unwrap_compiled(base_model.early_fusion).parameters()
     )
-    if args.lora:
+    if args.lora and base_model.lora_layers is not None:
         trainable_params += list(base_model.lora_layers.parameters())
 
     n_trainable = sum(p.numel() for p in trainable_params)
@@ -769,7 +752,7 @@ def train_validation():
     if args.use_precompute_vae_latents and n_workers_loop != args.dataloader_num_workers:
         if is_main:
             logger.info(
-                f"Recreating train_dataloader: "
+                f"Ricreazione train_dataloader: "
                 f"num_workers {args.dataloader_num_workers} → {n_workers_loop}"
             )
         del train_dataloader
@@ -806,12 +789,13 @@ def train_validation():
 
     if is_main:
         logger.info("=" * 60)
-        logger.info("START: TRAIN & VALIDATION")
+        logger.info("START: TRAIN & VALIDATION — FuseLIP / Early Fusion")
         logger.info(f"timestamp           : {time.strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"base_model          : {args.pretrained_model_name_or_path}")
         logger.info(f"train samples       : {len(train_dataset)}")
         logger.info(f"validation samples  : {len(validation_dataset)}")
         logger.info(f"train_batch_size    : {args.train_batch_size} (eff. {total_batch})")
+        logger.info(f"gradient_accum_steps: {args.gradient_accumulation_steps}")
         logger.info(f"max_train_steps     : {args.max_train_steps}")
         logger.info(f"learning_rate       : {args.learning_rate:.2e}")
         logger.info(f"AMP fp16            : {'ON' if use_amp else 'OFF'}")
@@ -820,7 +804,6 @@ def train_validation():
         logger.info(f"ef_num_layers       : {args.ef_num_layers}")
         logger.info(f"ef_dropout          : {args.ef_dropout}")
         logger.info(f"ef_n_audio_queries  : {getattr(args, 'ef_n_audio_queries', 1)}")
-        logger.info(f"UNet seq length     : actual_T_a + 1 + 77 (actual_T_a = n_audio_queries if >0 else T_a)")
         logger.info(f"cosine_loss         : {args.cosine_loss}")
         logger.info(f"trainable params    : {n_trainable:,}")
         logger.info(f"embeddings_dir      : {args.embeddings_dir}")
@@ -840,9 +823,7 @@ def train_validation():
                 with autocast(enabled=use_amp):
                     is_pre = vb.get("is_precomputed_latent", None)
                     if is_pre is not None and bool(is_pre.all()):
-                        lats = vb["pixel_values"].to(
-                            device, dtype=torch.float16, non_blocking=True
-                        )
+                        lats = vb["pixel_values"].to(device, dtype=torch.float16, non_blocking=True)
                     elif v_latent_cache:
                         lats = torch.stack(
                             [v_latent_cache[iid] for iid in vb["image_id"]]
@@ -861,9 +842,6 @@ def train_validation():
                     ).long()
                     nl  = noise_scheduler.add_noise(lats, nv, tv)
                     mp, fused_seq, audio_summary = model(af, iids, nl, tv)
-                    # Pool for auxiliary losses:
-                    #   fused_pooled  — all tokens (audio + sep + text), for L1/L2 reg
-                    #   audio_pooled  — PRE-transformer audio tokens only, for cosine loss
                     fused_pooled  = fused_seq.mean(dim=1)
                     audio_pooled  = audio_summary.mean(dim=1)
 
@@ -871,24 +849,21 @@ def train_validation():
                         nv if _prediction_type == "epsilon"
                         else noise_scheduler.get_velocity(lats, nv, tv).float()
                     )
-                    # LDM eq. (1/3): MSE on epsilon or velocity prediction
                     lv = F.mse_loss(mp, tgt, reduction="mean")
-                    # [MUSIPAINTER-EQ3] L1 reg on audio_pooled (e_audio), not fused_pooled
                     _reg = args.lambda_a * torch.mean(torch.abs(audio_pooled))
                     if args.lambda_b > 0:
                         _reg = _reg + args.lambda_b * (torch.norm(audio_pooled, p=2, dim=1) ** 2).mean()
                     lv = lv + _reg
 
                     if args.cosine_loss and _label_to_idx is not None:
-                        lbs     = vb['label']
-                        ridxs   = [_label_to_idx[l] for l in lbs if l in _label_to_idx]
-                        aidxs   = [j for j, l in enumerate(lbs) if l in _label_to_idx]
+                        lbs   = vb['label']
+                        ridxs = [_label_to_idx[l] for l in lbs if l in _label_to_idx]
+                        aidxs = [j for j, l in enumerate(lbs) if l in _label_to_idx]
                         if ridxs:
                             idx_t = torch.tensor(ridxs, device=device)
-                            ct    = _label_matrix.index_select(0, idx_t)  # pre-normalised l̂
+                            ct    = _label_matrix.index_select(0, idx_t)
                             ae    = audio_pooled[aidxs]
                             em_n  = F.normalize(ae.float(), dim=1)
-                            # ct already normalised in build_label_embedding_cache
                             cs    = (em_n * ct.float()).sum(dim=1).mean()
                             lv    = lv + args.lambda_c * (1 - cs) ** 2
                 running_vloss += lv.item()
@@ -930,7 +905,8 @@ def train_validation():
         model.train()
         if args.lora:
             base_model.unet.eval()
-            base_model.lora_layers.train()
+            if base_model.lora_layers is not None:
+                base_model.lora_layers.train()
         optimizer.zero_grad()
 
         _skip = batches_to_skip_first_epoch if epoch == epoch_number else 0
@@ -943,28 +919,14 @@ def train_validation():
             audio_features = batch["audio_features"]
             input_ids      = batch["input_ids"]
 
-            # [CFG-DROPOUT] Asymmetric classifier-free guidance dropout.
-            # Ho & Salimans (2022): during training, randomly replace the
-            # conditioning with null/empty conditioning so the model learns
-            # both p(x|c) and p(x) (unconditional). At inference, CFG then
-            # amplifies the conditional signal: ε̃ = ε_uncond + s*(ε_cond - ε_uncond).
-            #
-            # Three distributions trained (total ~10% dropout, consistent with
-            # Ho & Salimans recommendation):
-            #   ~7%: audio zeroed, text kept  → teaches p(x | text only)
-            #   ~3%: both zeroed              → teaches p(x) unconditional
-            #   ~90%: normal                  → teaches p(x | audio, text)
-            #
-            # The asymmetry (text-only > fully uncond) is intentional: it
-            # enables the --uncond_mode=text_only inference path in
-            # test_no_accel_colab.py, where CFG amplifies the audio
-            # contribution above the text-only baseline.
+            # [CFG-DROPOUT] Dropout asincrono per CFG (Ho & Salimans 2022)
+            # ~7%: zero audio → insegna p(x|text)
+            # ~3%: zero tutto → insegna p(x) fully unconditional
+            # ~90%: normale → insegna p(x|audio, text)
             _r = torch.rand(1).item()
             if _r < 0.07:
-                # ~7%: zero audio only (teaches p(x|text))
                 audio_features = torch.zeros_like(audio_features)
             elif _r < 0.10:
-                # ~3%: zero everything (teaches p(x) unconditional)
                 audio_features = torch.zeros_like(audio_features)
                 input_ids = torch.full_like(input_ids, tokenizer.pad_token_id or 0)
 
@@ -979,7 +941,6 @@ def train_validation():
                 else:
                     pixel_values = batch["pixel_values"]
                     with torch.no_grad():
-                        # LDM Sec. 3.1: scale latents by 1/σ (0.18215 for SD/SD2)
                         latents = (
                             base_model.vae.encode(
                                 pixel_values.to(dtype=torch.float16)
@@ -988,10 +949,8 @@ def train_validation():
 
                 bsz = latents.shape[0]
                 if _noise_buf is None or _noise_buf.shape != latents.shape:
-                    _noise_buf = torch.empty(
-                        latents.shape, dtype=torch.float32, device=device
-                    )
-                    _ts_buf = torch.empty((bsz,), dtype=torch.long, device=device)
+                    _noise_buf = torch.empty(latents.shape, dtype=torch.float32, device=device)
+                    _ts_buf    = torch.empty((bsz,), dtype=torch.long, device=device)
                 _noise_buf.normal_()
                 _ts_buf.random_(0, noise_scheduler.config.num_train_timesteps)
                 noise         = _noise_buf
@@ -999,13 +958,9 @@ def train_validation():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 if _prediction_type == "epsilon":
-                    # LDM eq. (1): predict the added noise ε
                     target = noise
                 elif _prediction_type == "v_prediction":
-                    # SD2 / v-parameterisation: predict the velocity v
-                    target = noise_scheduler.get_velocity(
-                        latents, noise, timesteps
-                    ).float()
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps).float()
                 else:
                     raise ValueError(f"Unknown prediction type: {_prediction_type}")
 
@@ -1013,31 +968,16 @@ def train_validation():
                     audio_features, input_ids, noisy_latents, timesteps,
                 )
 
-                # Pool for auxiliary losses (UNet already received the full sequence).
-                # fused_pooled: all tokens (audio + sep + text), for optional L1/L2 reg
-                # audio_pooled: PRE-transformer audio tokens only, for cosine loss
                 fused_pooled = fused_seq.mean(dim=1)
                 audio_pooled = audio_summary.mean(dim=1)
 
-                # LDM eq. (1/3): denoising MSE loss
                 loss = F.mse_loss(model_pred, target, reduction="mean")
 
-                # [MUSIPAINTER-EQ3] L1 regularisation on e_audio (audio_pooled).
-                # Musipainter eq. (3): L = L_LDM + λ_a ‖e_audio‖₁ + λ_c · CL
-                # Using audio_pooled (PRE-transformer) ensures regularisation
-                # targets the pure audio embedding, not the text-fused one.
                 _reg = args.lambda_a * torch.mean(torch.abs(audio_pooled))
                 if args.lambda_b > 0:
                     _reg = _reg + args.lambda_b * (torch.norm(audio_pooled, p=2, dim=1) ** 2).mean()
                 loss = loss + _reg
 
-                # [MUSIPAINTER-EQ2/5] Cosine alignment loss: aligns pure audio
-                # tokens (PRE-transformer) with the pre-normalised CLIP label l̂.
-                # CL = (1 - <e_audio/‖e_audio‖, l̂>)²
-                # Using audio_pooled (PRE-transformer) is correct because l̂ is
-                # a CLIP text embedding — aligning a post-fusion (text-informed)
-                # audio vector against another text vector would collapse the
-                # audio modality into trivial text-text similarity.
                 if args.cosine_loss and _label_to_idx is not None:
                     labels   = batch['label']
                     row_idxs = [_label_to_idx[lbl] for lbl in labels if lbl in _label_to_idx]
@@ -1045,7 +985,7 @@ def train_validation():
                     if row_idxs:
                         idx_t     = torch.tensor(row_idxs, dtype=torch.long, device=device)
                         aud_idx_t = torch.tensor(aud_idxs, dtype=torch.long, device=device)
-                        ct        = _label_matrix.index_select(0, idx_t)      # pre-normalised l̂
+                        ct        = _label_matrix.index_select(0, idx_t)
                         at        = audio_pooled.index_select(0, aud_idx_t)
                         em_n      = F.normalize(at.float(), dim=1)
                         cs        = (em_n * ct.float()).sum(dim=1).mean()
@@ -1081,7 +1021,7 @@ def train_validation():
                         _eta_h = int(args.max_train_steps * _sps // 3600)
                         _eta_m = int((args.max_train_steps * _sps % 3600) // 60)
                         logger.info(
-                            f"[PERF] Real speed (steps 10-40): {_sps:.2f}s/step  "
+                            f"[PERF] Velocità reale (steps 10-40): {_sps:.2f}s/step  "
                             f"ETA: ~{_eta_h}h {_eta_m:02d}m"
                         )
 
@@ -1110,7 +1050,7 @@ def train_validation():
                             f"weights/{args.run_name}_early_fusion-step{global_step}.safetensors"
                         )
                     )
-                    if args.lora:
+                    if args.lora and base_model.lora_layers is not None:
                         save_progress(
                             base_model.lora_layers,
                             os.path.join(
@@ -1166,22 +1106,20 @@ def train_validation():
                                 and best_model_path != _nb:
                             os.remove(best_model_path)
                         os.replace(_nb_tmp, _nb)
-                        if args.lora:
-                            _nl = _nb.replace(
-                                'best_model_early_fusion_', 'best_model_lora_'
-                            )
+                        if args.lora and base_model.lora_layers is not None:
+                            _nl = _nb.replace('best_model_early_fusion_', 'best_model_lora_')
                             _nl_tmp = _nl + ".tmp"
                             _sf_save(base_model.lora_layers.state_dict(), _nl_tmp)
                             os.replace(_nl_tmp, _nl)
                         best_model_path = _nb
                         logger.info(
-                            f"New best (mid-epoch step={global_step}): "
+                            f"Nuovo best (mid-epoch step={global_step}): "
                             f"vloss={best_vloss:.4f}"
                         )
                     model.train()
                     base_model.unet.eval()
                     base_model.vae.eval()
-                    if args.lora:
+                    if args.lora and base_model.lora_layers is not None:
                         base_model.lora_layers.train()
                     gc.collect()
                     if torch.cuda.is_available():
@@ -1236,21 +1174,19 @@ def train_validation():
                             and best_model_path != _nb:
                         os.remove(best_model_path)
                     os.replace(_nb_tmp, _nb)
-                    if args.lora:
-                        _nl = _nb.replace(
-                            'best_model_early_fusion_', 'best_model_lora_'
-                        )
+                    if args.lora and base_model.lora_layers is not None:
+                        _nl = _nb.replace('best_model_early_fusion_', 'best_model_lora_')
                         _nl_tmp = _nl + ".tmp"
                         _sf_save_ep(base_model.lora_layers.state_dict(), _nl_tmp)
                         os.replace(_nl_tmp, _nl)
                     best_model_path = _nb
                     logger.info(
-                        f"  New best early_fusion: {_nb} (vloss={best_vloss:.4f})"
+                        f"  Nuovo best early_fusion: {_nb} (vloss={best_vloss:.4f})"
                     )
                 model.train()
                 base_model.unet.eval()
                 base_model.vae.eval()
-                if args.lora:
+                if args.lora and base_model.lora_layers is not None:
                     base_model.lora_layers.train()
                 gc.collect()
                 if torch.cuda.is_available():
@@ -1269,13 +1205,13 @@ def train_validation():
             base_model.early_fusion,
             os.path.join(args.output_dir, "learned_embeds.safetensors")
         )
-        if args.lora:
+        if args.lora and base_model.lora_layers is not None:
             save_progress(
                 base_model.lora_layers,
                 os.path.join(args.output_dir, "learned_embeds_lora_layers.safetensors")
             )
         logger.info("=" * 60)
-        logger.info("TRAINING COMPLETED SUCCESSFULLY")
+        logger.info("TRAINING COMPLETATO CON SUCCESSO")
         logger.info(f"total steps         : {global_step}/{args.max_train_steps}")
         logger.info(f"best validation loss: {best_vloss:.4f}")
         logger.info(f"best model          : {best_model_path or 'N/A'}")

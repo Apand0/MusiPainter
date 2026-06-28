@@ -1,26 +1,6 @@
 # @title test_no_accel_colab.py
 """
-Inference script for Musipainter (Early Fusion branch).
-
-Generates images from audio embeddings using EarlyFusionEncoder +
-frozen Stable Diffusion UNet. Audio embeddings are loaded via
-LazyEmbeddingIndex which accepts a comma-separated --embeddings_dir
-pointing to one or more Kaggle Dataset directories.
-
-[FIX-CFG-T_A] The unconditional embedding sequence length is now
-inferred dynamically from the first sample of the dataset instead of
-being hardcoded. This ensures torch.cat([uncond, cond]) never
-fails with a size mismatch regardless of which temporal_pool_stride
-was used during preprocessing.
-
-Note on sequence lengths:
-  EarlyFusionEncoder outputs [B, actual_T_a + 1 + T_t, output_size] where:
-  actual_T_a = n_audio_queries (if >0) or T_a (if 0)
-  1   = FuseLIP separator token
-  T_t = 77 — CLIP text tokens
-  The +1 separator is handled internally by EarlyFusionEncoder and is
-  transparent to the UNet, which simply attends over the full sequence
-  as encoder_hidden_states (LDM Sec. 3.3).
+Inference script per Musipainter (Branch FuseLIP / Early Fusion).
 """
 
 import argparse
@@ -64,77 +44,62 @@ def parse_args():
             return False
         raise argparse.ArgumentTypeError(f"Valore booleano atteso, ricevuto: '{v}'")
 
-    parser = argparse.ArgumentParser(description="Testing script con pre-encoded embeddings")
+    parser = argparse.ArgumentParser(description="Inference script — Musipainter FuseLIP branch")
 
     from modules.preprocess.argparse_multiembedding import add_multiembedding_args
     add_multiembedding_args(parser)
 
-    parser.add_argument("--learned_embeds", type=str,
-                        default='./output/learned_embeds.safetensors')
-    parser.add_argument("--learned_vae", type=str,
-                        default='./output/vae_learned_embeds.bin')
-    parser.add_argument("--learned_aud_encoder", type=str,
-                        default='./output/aud_encoder_learned_embeds.bin')
-    parser.add_argument("--learned_unet", type=str,
-                        default='./output/unet_learned_embeds.bin')
-    parser.add_argument("--learned_embeds_lora", type=str,
-                        default='./output/learned_embeds_lora_layers.safetensors')
-    parser.add_argument("--pretrained_model_name_or_path", type=str,
-                        default='stabilityai/stable-diffusion-2')
-    parser.add_argument("--revision", type=str, default=None, required=False)
-    parser.add_argument("--tokenizer_name", type=str, default=None)
-    parser.add_argument("--data_dir", type=str, default="./Museart/")
-    parser.add_argument("--latents_dir", type=str, default="./image_latents/")
+    parser.add_argument("--learned_embeds",      type=str, default='./output/learned_embeds.safetensors')
+    parser.add_argument("--learned_vae",         type=str, default='./output/vae_learned_embeds.bin')
+    parser.add_argument("--learned_aud_encoder", type=str, default='./output/aud_encoder_learned_embeds.bin')
+    parser.add_argument("--learned_unet",        type=str, default='./output/unet_learned_embeds.bin')
+    parser.add_argument("--learned_embeds_lora", type=str, default='./output/learned_embeds_lora_layers.safetensors')
+    parser.add_argument("--pretrained_model_name_or_path", type=str, default='stabilityai/stable-diffusion-2')
+    parser.add_argument("--revision",            type=str, default=None, required=False)
+    parser.add_argument("--tokenizer_name",      type=str, default=None)
+    parser.add_argument("--data_dir",            type=str, default="./Museart/")
+    parser.add_argument("--latents_dir",         type=str, default="./image_latents/")
     parser.add_argument("--use_precomputed_embeddings", type=_str2bool, default=True)
-    parser.add_argument("--placeholder_token", type=str, default="<*>")
-    parser.add_argument("--output_dir", type=str, default="./output/test/")
-    parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--resolution", type=int, default=768)
+    parser.add_argument("--placeholder_token",   type=str, default="<*>")
+    parser.add_argument("--output_dir",          type=str, default="./output/test/")
+    parser.add_argument("--seed",                type=int, default=1234)
+    parser.add_argument("--resolution",          type=int, default=768)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
-    parser.add_argument("--logging_dir", type=str, default="logs")
-    parser.add_argument("--mixed_precision", type=str, default="fp16",
+    parser.add_argument("--logging_dir",         type=str, default="logs")
+    parser.add_argument("--mixed_precision",     type=str, default="fp16",
                         choices=["no", "fp16", "bf16"])
-    parser.add_argument("--allow_tf32", action="store_true")
-    parser.add_argument("--report_to", type=str, default="tensorboard")
+    parser.add_argument("--allow_tf32",          action="store_true")
+    parser.add_argument("--report_to",           type=str, default="tensorboard")
     parser.add_argument("--num_inference_steps", type=int, default=50)
-    parser.add_argument("--data_set", type=str, default='test',
+    parser.add_argument("--data_set",            type=str, default='test',
                         choices=['train', 'validation', 'test'])
-    parser.add_argument("--generation_steps", type=int, default=50)
-    parser.add_argument("--run_name", type=str, default='MusicToken')
-    parser.add_argument("--set_size", type=str, default='full')
-    parser.add_argument("--prompt", type=str,
-                        default='An art image of <*>')
-    parser.add_argument("--input_length", type=int, default=30)
-    parser.add_argument("--lora", type=_str2bool, default=False)
-    parser.add_argument("--aud_encoder", type=_str2bool, default=False)
-    parser.add_argument("--unet", type=_str2bool, default=False)
-    parser.add_argument("--vae", type=_str2bool, default=False)
-    parser.add_argument("--guidance_scale", type=float, default=4.0)
-    parser.add_argument("--center_crop", action="store_true", default=False)
-    parser.add_argument("--hf_cache_dir", type=str, default="/tmp/hf_model_cache")
+    parser.add_argument("--generation_steps",    type=int, default=50)
+    parser.add_argument("--run_name",            type=str, default='MusicToken')
+    parser.add_argument("--set_size",            type=str, default='full')
+    parser.add_argument("--prompt",              type=str, default='An art image of <*>')
+    parser.add_argument("--input_length",        type=int, default=30)
+    parser.add_argument("--lora",                type=_str2bool, default=False)
+    parser.add_argument("--aud_encoder",         type=_str2bool, default=False)
+    parser.add_argument("--unet",                type=_str2bool, default=False)
+    parser.add_argument("--vae",                 type=_str2bool, default=False)
+    parser.add_argument("--guidance_scale",      type=float, default=4.0)
+    parser.add_argument("--center_crop",         action="store_true", default=False)
+    parser.add_argument("--hf_cache_dir",        type=str, default="/tmp/hf_model_cache")
 
-    # Early Fusion hyper-parameters (must match training config)
-    parser.add_argument("--ef_d_model", type=int, default=512,
-                        help="EarlyFusionEncoder shared Transformer hidden dim.")
-    parser.add_argument("--ef_nhead", type=int, default=8,
-                        help="EarlyFusionEncoder number of attention heads.")
-    parser.add_argument("--ef_num_layers", type=int, default=4,
-                        help="EarlyFusionEncoder number of Transformer layers.")
-    parser.add_argument("--ef_dropout", type=float, default=0.1,
-                        help="EarlyFusionEncoder dropout rate.")
-    parser.add_argument("--ef_n_audio_queries", type=int, default=1,
-                        help="0=Full T_a (FuseLIP), 1=AttentivePooling (MusiPainter, default), >1=Resampler")
+    # Early Fusion hyper-parameters (devono corrispondere alla configurazione di training)
+    parser.add_argument("--ef_d_model",          type=int,   default=512)
+    parser.add_argument("--ef_nhead",            type=int,   default=8)
+    parser.add_argument("--ef_num_layers",       type=int,   default=4)
+    parser.add_argument("--ef_dropout",          type=float, default=0.1)
+    parser.add_argument("--ef_n_audio_queries",  type=int,   default=1,
+                        help="0=Full T_a (FuseLIP), 1=AttentivePooling (default), >1=Resampler")
     parser.add_argument(
         "--uncond_mode", type=str, default="zeros",
         choices=["zeros", "text_only"],
         help=(
-            "'zeros': unconditional embedding is all-zeros audio + empty text "
-            "(corresponds to p(x) — the fully unconditional distribution trained "
-            "via the ~3%% CFG dropout). "
-            "'text_only': unconditional embedding uses the text prompt without "
-            "audio (corresponds to p(x|text) — trained via the ~7%% audio-only "
-            "dropout). CFG then amplifies exactly the audio contribution above "
-            "the text-only baseline: ε̃ = ε_text + s*(ε_audio+text - ε_text)."
+            "'zeros' (default): uncond = audio silenzioso + testo vuoto → p(x). "
+            "Corrisponde al ~3%% CFG dropout full-zero usato in training. "
+            "'text_only': uncond = audio silenzioso + prompt testuale → p(x|text). "
         ),
     )
 
@@ -145,7 +110,7 @@ def parse_args():
         args.local_rank = env_local_rank
 
     if args.data_dir is None:
-        raise ValueError("Specify --data_dir.")
+        raise ValueError("Specificare --data_dir.")
 
     args.image_latents_dir = args.latents_dir
     return args
@@ -157,17 +122,17 @@ def parse_args():
 
 def _resolve_checkpoint_path(explicit_path, output_dir, stem, label):
     """
-    Resolve best available checkpoint, supporting .bin → .safetensors fallback.
+    Risolve il miglior checkpoint disponibile, con fallback .bin → .safetensors.
 
-    Search order:
-      1. explicit_path as provided
-      2. .safetensors sibling of a .bin explicit_path (format migration)
-      3. <output_dir>/<stem>.safetensors
-      4. <output_dir>/<stem>.bin
-      5. Most-recent best_model_<label>_*.safetensors in output_dir
-      6. Most-recent best_model_early_fusion_*.safetensors in output_dir
-      7. Most-recent weights/*_<label>-step*.safetensors in output_dir/weights/
-      8. Most-recent weights/*_early_fusion-step*.safetensors
+    Ordine di ricerca:
+      1. explicit_path come fornito
+      2. Sibling .safetensors di un explicit_path .bin
+      3. best_model_<label>_*.safetensors (validation loss più bassa)
+      4. best_model_early_fusion_*.safetensors
+      5. <output_dir>/<stem>.safetensors
+      6. <output_dir>/<stem>.bin
+      7. weights/*_<label>-step*.safetensors più recente
+      8. weights/*_early_fusion-step*.safetensors più recente
     """
     import glob
 
@@ -196,8 +161,8 @@ def _resolve_checkpoint_path(explicit_path, output_dir, stem, label):
             return hits[0]
 
     raise FileNotFoundError(
-        f"[AUTO-CHECKPOINT] No checkpoint found for '{label}'. "
-        f"Searched: {explicit_path} and glob patterns in {output_dir}."
+        f"[AUTO-CHECKPOINT] Nessun checkpoint trovato per '{label}'. "
+        f"Cercato: {explicit_path} e pattern glob in {output_dir}."
     )
 
 
@@ -207,17 +172,15 @@ def _resolve_checkpoint_path(explicit_path, output_dir, stem, label):
 
 def _probe_audio_frame_count(dataset) -> int:
     """
-    Load one sample from the dataset and return its audio frame count T_a.
+    Legge T_a dal primo sample del dataset.
 
-    This is the only correct way to obtain T_a: reading it from the actual
-    precomputed embeddings ensures the unconditional sequence always matches
-    the conditional one regardless of which temporal_pool_stride was used.
+    [FIX-BUG5] Rimosso il warning hardcoded su stride=4 / T_a=94.
+    Il valore di T_a probed è quello effettivo del checkpoint corrente —
+    confronti hardcoded su una configurazione specifica di stride causano
+    falsi positivi ogni volta che si allena con uno stride diverso.
 
-    Note: T_a is the number of BEATs frames in the precomputed embeddings,
-    NOT the output sequence length of EarlyFusionEncoder. UNet directly 
-    processes actual_T_a + 1 + T_t tokens, preserving the full temporal resolution
-    T_a is only needed here to size the silent audio tensor passed to
-    EarlyFusionEncoder when building the unconditional CFG embedding.
+    Il log informativo viene sempre emesso; l'utente può confrontare
+    il valore con quello registrato durante il training.
 
     stride=1  → T_a ≈ 376
     stride=4  → T_a ≈ 94
@@ -228,9 +191,9 @@ def _probe_audio_frame_count(dataset) -> int:
     first_batch  = next(iter(probe_loader))
     t_a = first_batch["audio_features"].shape[1]
     logger.info(
-        f"[CFG] Probed T_a={t_a} from first sample "
+        f"[CFG] T_a probed={t_a} dal primo sample "
         f"(shape={list(first_batch['audio_features'].shape)}). "
-        f"Silent audio tensor [1,{t_a},2304] will be used for unconditional CFG embedding."
+        f"Il silent audio tensor per CFG avrà shape [1,{t_a},2304]."
     )
     return t_a
 
@@ -248,37 +211,27 @@ def _build_uncond_embedding(
     device: torch.device,
 ) -> torch.Tensor:
     """
-    Build the unconditional embedding used for Classifier-Free Guidance (CFG).
+    Costruisce l'embedding unconditional per Classifier-Free Guidance (CFG).
 
-    CFG formula (Ho & Salimans 2022, applied in LDM Sec. 4 / Appendix):
+    Formula CFG (Ho & Salimans 2022):
         ε̃ = ε_uncond + s * (ε_cond - ε_uncond)
-    where s = guidance_scale and ε_uncond is produced by this function.
 
-    The silent audio tensor has shape [1, t_a, 2304] where t_a is inferred
-    dynamically from the dataset. The output retains the audio's native dimensions, 
-    always resulting in: [1, actual_T_a + 1 + T_t, output_size]
-    regardless of t_a. This matches the shape of the conditional embedding
-    produced in the generation loop, ensuring torch.cat([uncond, cond]) always
-    succeeds without a size mismatch.
+    [FIX-BUG3] early_fusion lavora in float32: il cast a weight_dtype avviene
+    solo sull'output finale, non sull'intero modello.
 
-    Args:
-        args:         parsed CLI args (uncond_mode, prompt, placeholder_token).
-        base_model:   MusicTokenWrapper instance.
-        tokenizer:    CLIPTokenizer.
-        t_a:          audio frame count read from the actual embeddings.
-        weight_dtype: fp16 / bf16 / fp32.
-        device:       CUDA or CPU device.
+    Il silent audio ha shape [1, t_a, 2304] dove t_a è letto dinamicamente
+    dal dataset — garantisce che uncond e cond abbiano sempre la stessa shape.
 
     Returns:
-        uncond_embeddings: [1, actual_T_a + 1 + T_t, output_size] float tensor.
+        uncond_embeddings: [1, actual_T_a + 1 + T_t, output_size]
     """
-    audio_dim     = 768 * 3          # BEATs layers 4+8+12 concatenated
-    silent_audio  = torch.zeros(1, t_a, audio_dim, dtype=weight_dtype, device=device)
+    audio_dim    = 768 * 3
+    silent_audio = torch.zeros(1, t_a, audio_dim, dtype=torch.float32, device=device)
 
     with torch.no_grad():
         if args.uncond_mode == "zeros":
-            # Empty text + silent audio → corresponds to p(x), the fully
-            # unconditional distribution trained via the ~3% CFG dropout.
+            # Audio silenzioso + testo vuoto → p(x) fully unconditional.
+            # Corrisponde al ~3% CFG dropout full-zero usato in training.
             uncond_ids = tokenizer(
                 [""],
                 padding="max_length",
@@ -286,24 +239,22 @@ def _build_uncond_embedding(
                 truncation=True,
                 return_tensors="pt",
             ).input_ids.to(device)
-            uncond_text = base_model._get_text_embeddings(uncond_ids).to(weight_dtype)
+            uncond_text = base_model._get_text_embeddings(uncond_ids)  # float32
 
             uncond_embeddings = base_model.early_fusion(
                 audio_tokens=silent_audio,
                 text_tokens=uncond_text,
-            )   # [1, actual_T_a+1+T_t, output_size]
+            )  # [1, actual_T_a+1+T_t, output_size]  float32
 
             logger.info(
                 f"[CFG] uncond_mode=zeros | "
-                f"silent audio shape=[1,{t_a},{audio_dim}] | "
+                f"silent_audio=[1,{t_a},{audio_dim}] | "
                 f"uncond_embeddings shape={list(uncond_embeddings.shape)}"
             )
 
-        else:   # text_only
-            # Prompt text without the placeholder + silent audio → corresponds
-            # to p(x|text), the text-conditioned distribution trained via the
-            # ~7% audio-only dropout. CFG with this baseline amplifies exactly
-            # the audio contribution above the text-only representation:
+        else:  # text_only
+            # Prompt testuale senza placeholder + audio silenzioso → p(x|text).
+            # CFG amplifica il contributo audio sopra la baseline text-only:
             #   ε̃ = ε_text + s * (ε_audio+text - ε_text)
             text_only_prompt = args.prompt.replace(args.placeholder_token, "").strip()
             uncond_ids = tokenizer(
@@ -313,21 +264,22 @@ def _build_uncond_embedding(
                 truncation=True,
                 return_tensors="pt",
             ).input_ids.to(device)
-            uncond_text = base_model._get_text_embeddings(uncond_ids).to(weight_dtype)
+            uncond_text = base_model._get_text_embeddings(uncond_ids)  # float32
 
             uncond_embeddings = base_model.early_fusion(
                 audio_tokens=silent_audio,
                 text_tokens=uncond_text,
-            )   # [1, actual_T_a+1+T_t, output_size]
+            )  # [1, actual_T_a+1+T_t, output_size]  float32
 
             logger.info(
                 f"[CFG] uncond_mode=text_only | "
                 f"prompt='{text_only_prompt}' | "
-                f"silent audio shape=[1,{t_a},{audio_dim}] | "
+                f"silent_audio=[1,{t_a},{audio_dim}] | "
                 f"uncond_embeddings shape={list(uncond_embeddings.shape)}"
             )
 
-    return uncond_embeddings
+    # [FIX-BUG3] Cast a weight_dtype solo sull'output, non sull'intero modello
+    return uncond_embeddings.to(dtype=weight_dtype)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,7 +287,7 @@ def _build_uncond_embedding(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def inference(args):
-    """Run Early Fusion inference loop and save generated images."""
+    """Loop di inferenza Early Fusion e salvataggio immagini generate."""
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "imgs"), exist_ok=True)
@@ -360,14 +312,14 @@ def inference(args):
 
     _n_q = getattr(args, 'ef_n_audio_queries', 1)
     _seq_desc = (
-        f"T_a + 1 + 77 (Full Temporal Resolution)"
+        f"T_a + 1 + 77 (Full Temporal — FuseLIP puro)"
         if _n_q == 0 else
         f"{_n_q} + 1 + 77 (Resampler)" if _n_q > 1 else
         f"1 + 1 + 77 (AttentivePooling)"
     )
 
     logger.info("=" * 60)
-    logger.info("START: INFERENCE — Early Fusion branch")
+    logger.info("START: INFERENCE — FuseLIP / Early Fusion branch")
     logger.info(f"timestamp           : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"GPU                 : {_n_gpus}  ({_gpu_info})")
     logger.info(f"base_model          : {args.pretrained_model_name_or_path}")
@@ -420,7 +372,7 @@ def inference(args):
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     logger.info(
-        f"LazyEmbeddingIndex will scan: {args.embeddings_dir}  "
+        f"LazyEmbeddingIndex: {args.embeddings_dir}  "
         f"[preload_all={args.embeddings_preload_all}, "
         f"max_sf_handles={args.embeddings_max_sf_handles}]"
     )
@@ -434,10 +386,15 @@ def inference(args):
         "bf16": torch.bfloat16,
     }.get(args.mixed_precision, torch.float32)
 
-    model = MusicTokenWrapper(args).to(weight_dtype).eval().to(device)
+    # [FIX-BUG3] NON chiamare .to(weight_dtype) qui.
+    # UNet e VAE sono già in fp16 grazie a from_pretrained(torch_dtype=frozen_dtype)
+    # in MusicToken_no_accel.py. Aggiungere .to(weight_dtype) forza anche
+    # early_fusion in fp16, causando RuntimeError nei layer lineari che
+    # ricevono input float32. Il .to(device) è sufficiente.
+    model = MusicTokenWrapper(args).eval().to(device)
     base_model = model
 
-    # ── Scheduler (EulerDiscrete, v-prediction safe for SD 2.x) ──────────────
+    # ── Scheduler ─────────────────────────────────────────────────────────────
     from diffusers import EulerDiscreteScheduler
     scheduler = EulerDiscreteScheduler.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -450,13 +407,10 @@ def inference(args):
     )
 
     # ── Dynamic T_a probe ─────────────────────────────────────────────────────
-    # [FIX-CFG-T_A] Read the actual BEATs frame count from the first dataset
-    # sample. This is needed only to size the silent audio tensor for the
-    # unconditional CFG embedding; the EarlyFusionEncoder will compress it
-    # internally based on n_audio_queries, so the UNet always sees actual_T_a+1+T_t tokens.
+    # [FIX-BUG5] Nessun warning hardcoded — solo log informativo del valore reale.
     t_a: int = _probe_audio_frame_count(test_dataset)
 
-    # ── Unconditional embedding for CFG (built once, reused for all samples) ──
+    # ── Unconditional embedding per CFG (costruito una volta sola) ────────────
     uncond_embeddings = _build_uncond_embedding(
         args=args,
         base_model=base_model,
@@ -466,7 +420,7 @@ def inference(args):
         device=device,
     )
 
-    # ── Tokenise the conditional prompt (constant across all images) ──────────
+    # ── Tokenizza il prompt condizionale (costante per tutti i sample) ────────
     cond_input_ids = tokenizer(
         [args.prompt],
         padding="max_length",
@@ -475,7 +429,7 @@ def inference(args):
         return_tensors="pt",
     ).input_ids.to(device)
 
-    # ── DataLoader for generation loop ────────────────────────────────────────
+    # ── DataLoader per il loop di generazione ─────────────────────────────────
     dataloader_generator = torch.Generator(device="cpu")
     if args.seed is not None:
         dataloader_generator.manual_seed(args.seed)
@@ -498,35 +452,31 @@ def inference(args):
             if isinstance(value, torch.Tensor):
                 batch[key] = value.to(device)
 
-        aud_features = batch["audio_features"].to(dtype=weight_dtype)
+        aud_features = batch["audio_features"].to(dtype=torch.float32)
 
-        # Sanity-check: the conditional T_a must match what we probed above.
-        # If it doesn't, there are mixed-stride embeddings in the dataset —
-        # which should never happen but is detected here explicitly.
+        # Sanity-check: T_a condizionale deve corrispondere a quello probed.
         assert aud_features.shape[1] == t_a, (
-            f"[CFG] Audio frame count mismatch at step {step}: "
-            f"expected T_a={t_a} (probed from dataset) but got "
+            f"[CFG] Audio frame count mismatch al step {step}: "
+            f"atteso T_a={t_a} (probed dal dataset) ma ricevuto "
             f"T_a={aud_features.shape[1]}. "
-            "Check that all embeddings were preprocessed with the same stride."
+            "Verifica che tutti gli embeddings siano stati preprocessati con lo stesso stride."
         )
 
         with torch.no_grad():
             # ── Conditional embedding (audio + text fused) ────────────────────
-            # EarlyFusionEncoder: τ_θ(audio, text) → [1, actual_T_a+1+T_t, output_size]
-            text_tokens = base_model._get_text_embeddings(cond_input_ids).to(weight_dtype)
+            text_tokens = base_model._get_text_embeddings(cond_input_ids)  # float32
             cond_embeddings = base_model.early_fusion(
                 audio_tokens=aud_features,
                 text_tokens=text_tokens,
-            )   # [1, actual_T_a+1+T_t, output_size]
+            )  # [1, actual_T_a+1+T_t, output_size]  float32
 
-            # CFG (LDM Sec. 4 / Ho & Salimans 2022):
-            # stack uncond + cond → [2, actual_T_a+1+T_t, output_size]
-            # Both tensors have the same sequence length because the
-            # EarlyFusionEncoder uses the same n_audio_queries for both.
+            # Cast a weight_dtype solo sull'output, non sull'intero modello
+            cond_embeddings = cond_embeddings.to(dtype=weight_dtype)
+
+            # CFG: stack [uncond, cond] → [2, actual_T_a+1+T_t, output_size]
             text_embeddings = torch.cat([uncond_embeddings, cond_embeddings])
-            # [2, actual_T_a+1+T_t, output_size]
 
-            # ── Latent diffusion (LDM Sec. 3.2) ──────────────────────────────
+            # ── Latent diffusion ──────────────────────────────────────────────
             seed = random.randint(0, 10000)
             generator = torch.Generator(device=device).manual_seed(seed)
             latents = torch.randn(
@@ -547,15 +497,14 @@ def inference(args):
                     encoder_hidden_states=text_embeddings,
                 ).sample
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                # CFG formula: ε̃ = ε_uncond + s * (ε_cond - ε_uncond)
+                # CFG: ε̃ = ε_uncond + s * (ε_cond - ε_uncond)
                 noise_pred = noise_pred_uncond + args.guidance_scale * (
                     noise_pred_text - noise_pred_uncond
                 )
                 latents = scheduler.step(noise_pred, t, latents).prev_sample
 
-            # ── VAE decode (LDM Sec. 3.1) ─────────────────────────────────────
-            # Undo the 0.18215 scaling applied during encoding
-            _sf = base_model.vae.config.scaling_factor    # 0.18215 for SD/SD2
+            # ── VAE decode ────────────────────────────────────────────────────
+            _sf = base_model.vae.config.scaling_factor  # 0.18215 per SD/SD2
             latents = latents / _sf
             base_model.vae.to(dtype=torch.float32)
             image_tensor = base_model.vae.decode(
@@ -574,7 +523,7 @@ def inference(args):
             f'{batch["aud_id"][0]}_{batch["image_id"][0]}_{batch["label"][0]}.jpg'
         )
         image.save(os.path.join(args.output_dir, "imgs", args.run_name, save_name))
-        logger.info(f"Saved: {save_name} ({step + 1}/{args.generation_steps})")
+        logger.info(f"Salvato: {save_name} ({step + 1}/{args.generation_steps})")
 
     _total = time.time() - _t_start
     n_gen  = min(step + 1, args.generation_steps)
