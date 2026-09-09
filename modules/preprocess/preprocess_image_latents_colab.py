@@ -23,7 +23,7 @@ from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from utils import save_safetensors, open_safetensors
+from modules.preprocess.utils import save_safetensors, open_safetensors
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -165,7 +165,7 @@ def _flush_chunk( latents: dict[str, torch.Tensor], chunks_dir: Path, chunks_idx
     save_safetensors(latents, path)
     size_mb = path.stat().st_size / (1024 ** 2)
     logger.info(
-        f"  [FLUSH] chunks_{chunk_idx:04d}.safetensors  "
+        f"  [FLUSH] chunks_{chunks_idx:04d}.safetensors  "
         f"({len(latents)} immagini, {size_mb:.1f} MB)"
     )
 
@@ -201,17 +201,17 @@ def _merge_chunks( chunks_dir: Path, output_sf: Path, resolution: int, center_cr
         return False
 
     logger.info(
-        f"STREAMING merge of {len(chunk_files)} chunks ({total_mb:.0f} MB totali) "
+        f"STREAMING merge of {len(chunks_files)} chunks ({total_mb:.0f} MB totali) "
         f"→ {output_sf.name}  (max extra space: ~{largest_mb:.0f} MB)"
     )
 
     all_latents: dict[str, torch.Tensor] = {}
-    for chunks_file in chunks_files:
+    for chunk_file in chunks_files:
         sf = open_safetensors(chunk_file)
         for key in sf.keys():
             all_latents[key] = sf.get_tensor(key)
         del sf
-        chunks_file.unlink()
+        chunk_file.unlink()
         logger.info(f"  Read and deleted {chunk_file.name}  ({len(all_latents)} latenti finora)")
         gc.collect()
 

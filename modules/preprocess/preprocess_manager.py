@@ -99,10 +99,10 @@ def _print_upload_instructions(
     all_ds = existing_datasets + [f"/kaggle/input/{ds_name}"]
     ds_arg = ",".join(all_ds)
     logger.info(
-        f"       python kaggle_preprocess_manager.py \\n"
-        f"           --audio_dir {audio_dir_global} \\n"
-        f"           --output_base {output_base_global} \\n"
-        f"           --temporal_pool_stride {stride} \\n"
+        f"       python preprocess_manager.py \n"
+        f"           --audio_dir {audio_dir_global} \n"
+        f"           --output_base {output_base_global} \n"
+        f"           --temporal_pool_stride {stride} \n"
         f"           --existing_datasets {ds_arg}\n"
         f"\n"
         f"  The script will skip all IDs already in those datasets.\n"

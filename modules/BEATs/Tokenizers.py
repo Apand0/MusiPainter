@@ -161,7 +161,11 @@ class Tokenizers(nn.Module):
 
         x = self.dropout_input(features)
 
-        x, layer_results = self.encoder(
+        # TransformerEncoder.forward() (modules/BEATs/backbone.py) returns a
+        # TRIPLE (x, layers_sum, layers), not a pair. The original code did
+        # `x, layer_results = self.encoder(...)` which raised
+        # `ValueError: too many values to unpack` on every call.
+        x, layers_sum, layers = self.encoder(
             x,
             padding_mask=padding_mask,
         )

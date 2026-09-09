@@ -27,7 +27,6 @@ from torch.utils.data import Dataset
 import logging
 
 from modules.preprocess.utils import safe_torch_load as _safe_torch_load, open_safetensors
-from modules.preprocess.argparse_multiembedding import LazyEmbeddingIndex
 
 logger = logging.getLogger(__name__)
 
