@@ -1,12 +1,12 @@
 # @title modules/MusicToken/MusicToken_no_accel_ca.py
 """
-MusicToken_no_accel_ca.py — Core model wrapper per Musipainter (VERSIONE DEFINITIVA SDPA)
+MusicToken_no_accel_ca.py — Core model wrapper for Musipainter (FINAL SDPA VERSION)
 
-NOTE: file rinominato da MusicToken_no_accel.py a MusicToken_no_accel_ca.py per poter
-convivere nello stesso repository con la variante Early-Fusion
-(MusicToken_no_accel_ef.py), selezionabile tramite musipainter_train.py /
-musipainter_test.py con --architecture Musipainter-CA. Nessuna logica è stata
-modificata rispetto al file originale.
+NOTE: File renamed from MusicToken_no_accel.py to MusicToken_no_accel_ca.py to
+coexist in the same repository with the Early-Fusion variant
+(MusicToken_no_accel_ef.py), selectable via musipainter_train.py /
+musipainter_test.py with --architecture Musipainter-CA. No logic has been
+modified from the original file.
 """
 
 import gc
@@ -127,30 +127,30 @@ class MusicTokenWrapper(nn.Module):
         if self.aud_encoder is not None:
             self.aud_encoder.eval()
 
-        # ── CONFIGURAZIONE LORA ROBUSTA (SDPA) ──────────────────────────────
+        # ── ROBUST LORA CONFIGURATION (SDPA) ──────────────────────────────
         if getattr(args, 'lora', False):
             from diffusers.models.attention_processor import LoRAAttnProcessor2_0, LoRAAttnProcessor
             from diffusers.loaders import AttnProcsLayers
 
-            logger.info("--- CONFIGURAZIONE LORA (Diffusers 0.25.1) ---")
+            logger.info("--- LORA CONFIGURATION (Diffusers 0.25.1) ---")
 
             lora_attn_procs = {}
 
             attn_proc_keys = list(self.unet.attn_processors.keys())
 
             if attn_proc_keys:
-                logger.info(f"[LORA-DEBUG] Primi 3 processor names: {attn_proc_keys[:3]}")
-                logger.info(f"[LORA-DEBUG] Totale processor keys: {len(attn_proc_keys)}")
+                logger.info(f"[LORA-DEBUG] First 3 processor names: {attn_proc_keys[:3]}")
+                logger.info(f"[LORA-DEBUG] Total processor keys: {len(attn_proc_keys)}")
             else:
-                logger.warning("[LORA-DEBUG] attn_processors.keys() è vuoto! Provo fallback...")
+                logger.warning("[LORA-DEBUG] attn_processors.keys() is empty! Trying fallback...")
 
             if not attn_proc_keys:
                 for name, module in self.unet.named_modules():
                     if hasattr(module, 'to_q') and hasattr(module, 'to_k') and hasattr(module, 'to_v'):
                         processor_name = name + ".processor"
                         attn_proc_keys.append(processor_name)
-                        logger.info(f"[LORA-DEBUG] Trovato modulo attention: {processor_name}")
-                logger.info(f"[LORA-DEBUG] Totale keys dopo fallback: {len(attn_proc_keys)}")
+                        logger.info(f"[LORA-DEBUG] Found attention module: {processor_name}")
+                logger.info(f"[LORA-DEBUG] Total keys after fallback: {len(attn_proc_keys)}")
 
             for name in attn_proc_keys:
                 cross_attention_dim = None if name.endswith("attn1.processor") else self.unet.config.cross_attention_dim
@@ -169,14 +169,14 @@ class MusicTokenWrapper(nn.Module):
                     elif "mid_block" in name:
                         hidden_size = self.unet.config.block_out_channels[-1]
                     else:
-                        logger.warning(f"[LORA] Ignorato blocco non standard: {name}")
+                        logger.warning(f"[LORA] Skipped non-standard block: {name}")
                         continue
                 except (ValueError, IndexError, AttributeError) as e:
-                    logger.error(f"[LORA] Errore nel parsing di {name}: {e}")
+                    logger.error(f"[LORA] Error parsing {name}: {e}")
                     continue
 
                 if hidden_size is None:
-                    logger.warning(f"[LORA] hidden_size None per {name}, skip")
+                    logger.warning(f"[LORA] hidden_size None for {name}, skip")
                     continue
 
                 try:
@@ -186,7 +186,7 @@ class MusicTokenWrapper(nn.Module):
                         rank=getattr(args, 'lora_rank', 8)
                     )
                 except Exception as e:
-                    logger.warning(f"[LORA] LoRAAttnProcessor2_0 fallito per {name}: {e}")
+                    logger.warning(f"[LORA] LoRAAttnProcessor2_0 failed for {name}: {e}")
                     try:
                         proc = LoRAAttnProcessor(
                             hidden_size=hidden_size,
@@ -194,7 +194,7 @@ class MusicTokenWrapper(nn.Module):
                             rank=getattr(args, 'lora_rank', 8)
                         )
                     except Exception as e2:
-                        logger.error(f"[LORA] Anche LoRAAttnProcessor fallito per {name}: {e2}")
+                        logger.error(f"[LORA] LoRAAttnProcessor also failed for {name}: {e2}")
                         continue
 
                 lora_attn_procs[name] = proc
@@ -205,7 +205,7 @@ class MusicTokenWrapper(nn.Module):
 
                 n_lora = len(lora_attn_procs)
                 n_params = sum(p.numel() for p in self.lora_layers.parameters())
-                logger.info(f"Installati {n_lora} processori LoRA ({n_params:,} parametri).")
+                logger.info(f"Installed {n_lora} LoRA processors ({n_params:,} parameters).")
                 logger.info("SDPA (PyTorch native): ON — xformers skipped to preserve LoRA")
             else:
                 logger.error("CRITICAL: LoRA installed on 0 processors! Diffusers version may be incompatible.")
@@ -220,7 +220,7 @@ class MusicTokenWrapper(nn.Module):
                 self.unet.enable_xformers_memory_efficient_attention()
                 logger.info("xformers memory efficient attention: ON")
             except Exception as e:
-                logger.info(f"xformers non abilitato ({e}). Falling back to PyTorch 2.0 SDPA.")
+                logger.info(f"xformers not enabled ({e}). Falling back to PyTorch 2.0 SDPA.")
                 try:
                     from diffusers.models.attention_processor import AttnProcessor2_0
                     self.unet.set_attn_processor(AttnProcessor2_0())

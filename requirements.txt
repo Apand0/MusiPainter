@@ -1,0 +1,25 @@
+# 1. PyTorch stack (optimized for CUDA 12.1)
+# Note: Install with --index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+xformers
+
+# 2. Hugging Face stack (pinned for compatibility)
+huggingface-hub==0.22.2
+transformers==4.38.2
+diffusers==0.25.1
+datasets==2.18.0
+accelerate
+peft==0.8.2
+
+# 3. Support libraries: hardware, audio, and utilities
+ftfy
+tensorboard
+opencv-python
+Pillow
+pandas
+soundfile
+safetensors
+timm
+scikit-learn

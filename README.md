@@ -1,44 +1,73 @@
 # MusiPainter
-Thesis Project that follow the model Musipainter to create image based on audio track and artistic motif
 
-Executed by actual modules:
-- BEATs Model: https://huggingface.co/camenduru/beats/resolve/main/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt
-- Stable Diffusion: sd2-community/stable-diffusion-2-1
-- Various Library: [torch==2.5.1, torchvision==0.20.1, torchaudio==2.5.1, xformers, huggingface-hub==0.22.2, transformers==4.38.2, diffusers==0.25.1, datasets==2.18.0, peft==0.8.2, accelerate, ftfy, tensorboard, opencv-python, Pillow, pandas, soundfile, safetensors, timm, scikit-learn]
+## Introduction
+MusiPainter is a thesis project for generating images from music tracks. This implementation is based on the existing [Music_to_figurative_art](https://github.com/AlfredoBaione/Music_to_figurative_art) model, adapted and optimized for processing the [Museart](https://www.kaggle.com/datasets/alfredobaione/museart) dataset. The system supports two fusion architectures: Early Fusion and Cross-Attention, which combine audio features with text embeddings to generate artistic images that reflect the input music's characteristics and motifs.
 
-# Uso
+## Execution Environment
+All development and execution was performed on Kaggle cloud environment, leveraging GPU acceleration for efficient training and inference.
 
-## Train
+## Models
+- **BEATs Model**: [https://huggingface.co/camenduru/beats/resolve/main/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt](https://huggingface.co/camenduru/beats/resolve/main/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt)
+- **Stable Diffusion**: `sd2-community/stable-diffusion-2-1`
+
+## Usage
+
+### Preprocessing
+
 ```bash
-# Early Fusion
-python musipainter_train.py --architecture Musipainter-EF \
+# Preprocess audio embeddings
+python modules/preprocess/preprocess_audio_embeddings_colab.py \
+    --audio_dir ./Museart/ \
+    --output_dir ./output/audio_embeddings/ \
+    --beats_checkpoint models/BEATs/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt
+    ...
+
+# Preprocess image latents
+python modules/preprocess/preprocess_image_latents_colab.py \
+    --image_dir ./Museart/images/ \
+    --output_dir ./output/image_latents/ \
+    --pretrained_model_name_or_path stabilityai/stable-diffusion-2
+    ...
+```
+
+### Training
+
+#### Early Fusion
+```bash
+python musipainter_train.py \
+    --architecture Musipainter-EF \
     --data_dir ./Museart/ \
     --embeddings_dir ./audio_embeddings/ \
     --train_batch_size 2 \
     --max_train_steps 20000
-    ...
+```
 
-# Cross-Attention
-python musipainter_train.py --architecture Musipainter-CA \
+#### Cross-Attention
+```bash
+python musipainter_train.py \
+    --architecture Musipainter-CA \
     --data_dir ./Museart/ \
     --embeddings_dir ./audio_embeddings/ \
     --train_batch_size 8 \
     --max_train_steps 20000
-    ...
 ```
-## Test
-```bash
-# Early Fusion
-python musipainter_test.py --architecture Musipainter-EF \
-    --data_dir ./Museart/ \
-    --embeddings_dir ./audio_embeddings/ \
-    --learned_embeds ./output/learned_embeds.safetensors
-    ...
 
-# Cross-Attention
-python musipainter_test.py --architecture Musipainter-CA \
+### Inference
+
+#### Early Fusion
+```bash
+python musipainter_test.py \
+    --architecture Musipainter-EF \
     --data_dir ./Museart/ \
     --embeddings_dir ./audio_embeddings/ \
     --learned_embeds ./output/learned_embeds.safetensors
-    ...
+```
+
+#### Cross-Attention
+```bash
+python musipainter_test.py \
+    --architecture Musipainter-CA \
+    --data_dir ./Museart/ \
+    --embeddings_dir ./audio_embeddings/ \
+    --learned_embeds ./output/learned_embeds.safetensors
 ```

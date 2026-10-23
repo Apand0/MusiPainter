@@ -1,12 +1,12 @@
 # @title modules/MusicToken/MusicToken_no_accel_ef.py
 """
-MusicToken_no_accel_ef.py — Core model wrapper per Musipainter (Branch FuseLIP / Strada B).
+MusicToken_no_accel_ef.py — Core model wrapper for Musipainter (Branch FuseLIP / Path B).
 
-NOTE: file rinominato da MusicToken_no_accel.py a MusicToken_no_accel_ef.py per poter
-convivere nello stesso repository con la variante Cross-Attention
-(MusicToken_no_accel_ca.py), selezionabile tramite musipainter_train.py /
-musipainter_test.py con --architecture Musipainter-EF. Nessuna logica è stata
-modificata rispetto al file originale.
+NOTE: File renamed from MusicToken_no_accel.py to MusicToken_no_accel_ef.py to
+coexist in the same repository with the Cross-Attention variant
+(MusicToken_no_accel_ca.py), selectable via musipainter_train.py /
+musipainter_test.py with --architecture Musipainter-EF. No logic has been
+modified from the original file.
 """
 
 import gc
@@ -39,9 +39,9 @@ def _load_weights(path, map_device) -> dict:
 
 class MusicTokenWrapper(nn.Module):
     """
-    Wraps VAE, UNet, CLIP token embeddings, BEATs e EarlyFusionEncoder.
+    Wraps VAE, UNet, CLIP token embeddings, BEATs and EarlyFusionEncoder.
 
-    Solo EarlyFusionEncoder (e LoRA opzionale) ha requires_grad=True.
+    Only EarlyFusionEncoder (and optional LoRA) has requires_grad=True.
     """
 
     def __init__(self, args):
@@ -116,7 +116,7 @@ class MusicTokenWrapper(nn.Module):
         n_audio_queries = getattr(args, 'ef_n_audio_queries', 1)
 
         logger.info(
-            f"EarlyFusionEncoder (FuseLIP / Strada B): "
+            f"EarlyFusionEncoder (FuseLIP / Path B): "
             f"n_audio_queries={n_audio_queries} (0=Full, 1=Pooling, >1=Resampler), "
             f"audio_dim={audio_dim}, text_dim={self._text_dim}, "
             f"output_size={output_size}, d_model={d_model}, "
@@ -134,35 +134,35 @@ class MusicTokenWrapper(nn.Module):
             dropout=dropout,
             n_audio_queries=n_audio_queries,
         )
-        self.embedder = self.early_fusion  # alias per checkpoint helpers
+        self.embedder = self.early_fusion  # alias for checkpoint helpers
 
-        # ── Eval mode per frozen components ───────────────────────────────────
+        # ── Eval mode for frozen components ───────────────────────────────────
         self.vae.eval()
         self.unet.eval()
         self.token_embedding.eval()
         if self.aud_encoder is not None:
             self.aud_encoder.eval()
 
-        # ── LoRA — parsing robusto + LoRAAttnProcessor2_0 + ordine corretto
+        # ── LoRA — robust parsing + LoRAAttnProcessor2_0 + correct order
         if hasattr(args, 'lora') and args.lora:
             from diffusers.models.attention_processor import LoRAAttnProcessor2_0, LoRAAttnProcessor
             from diffusers.loaders import AttnProcsLayers
 
-            logger.info("--- CONFIGURAZIONE LORA (FuseLIP) ---")
+            logger.info("--- LORA CONFIGURATION (FuseLIP) ---")
 
             lora_attn_procs = {}
 
             attn_proc_keys = list(self.unet.attn_processors.keys())
 
             if attn_proc_keys:
-                logger.info(f"[LORA] Primi 3 processor names: {attn_proc_keys[:3]}")
-                logger.info(f"[LORA] Totale processor keys: {len(attn_proc_keys)}")
+                logger.info(f"[LORA] First 3 processor names: {attn_proc_keys[:3]}")
+                logger.info(f"[LORA] Total processor keys: {len(attn_proc_keys)}")
             else:
-                logger.warning("[LORA] attn_processors.keys() vuoto — fallback su named_modules()")
+                logger.warning("[LORA] attn_processors.keys() empty — fallback to named_modules()")
                 for name, module in self.unet.named_modules():
                     if hasattr(module, 'to_q') and hasattr(module, 'to_k') and hasattr(module, 'to_v'):
                         attn_proc_keys.append(name + ".processor")
-                logger.info(f"[LORA] Totale keys dopo fallback: {len(attn_proc_keys)}")
+                logger.info(f"[LORA] Total keys after fallback: {len(attn_proc_keys)}")
 
             for name in attn_proc_keys:
                 cross_attention_dim = (
@@ -184,14 +184,14 @@ class MusicTokenWrapper(nn.Module):
                     elif "mid_block" in name:
                         hidden_size = self.unet.config.block_out_channels[-1]
                     else:
-                        logger.warning(f"[LORA] Blocco non standard ignorato: {name}")
+                        logger.warning(f"[LORA] Skipped non-standard block: {name}")
                         continue
                 except (ValueError, IndexError, AttributeError) as e:
-                    logger.error(f"[LORA] Errore parsing {name}: {e}")
+                    logger.error(f"[LORA] Error parsing {name}: {e}")
                     continue
 
                 if hidden_size is None:
-                    logger.warning(f"[LORA] hidden_size None per {name}, skip")
+                    logger.warning(f"[LORA] hidden_size None for {name}, skip")
                     continue
 
                 try:
@@ -201,7 +201,7 @@ class MusicTokenWrapper(nn.Module):
                         rank=getattr(args, 'lora_rank', 8),
                     )
                 except Exception as e:
-                    logger.warning(f"[LORA] LoRAAttnProcessor2_0 fallito per {name}: {e}")
+                    logger.warning(f"[LORA] LoRAAttnProcessor2_0 failed for {name}: {e}")
                     try:
                         proc = LoRAAttnProcessor(
                             hidden_size=hidden_size,
@@ -209,7 +209,7 @@ class MusicTokenWrapper(nn.Module):
                             rank=getattr(args, 'lora_rank', 8),
                         )
                     except Exception as e2:
-                        logger.error(f"[LORA] Anche LoRAAttnProcessor fallito per {name}: {e2}")
+                        logger.error(f"[LORA] LoRAAttnProcessor also failed for {name}: {e2}")
                         continue
 
                 lora_attn_procs[name] = proc
@@ -219,13 +219,13 @@ class MusicTokenWrapper(nn.Module):
                 self.lora_layers = AttnProcsLayers(self.unet.attn_processors)
                 n_params = sum(p.numel() for p in self.lora_layers.parameters())
                 logger.info(
-                    f"[LORA] Installati {len(lora_attn_procs)} processori "
-                    f"({n_params:,} parametri). SDPA (PyTorch native): ON"
+                    f"[LORA] Installed {len(lora_attn_procs)} processors "
+                    f"({n_params:,} parameters). SDPA (PyTorch native): ON"
                 )
             else:
                 logger.error(
                     "[LORA] CRITICAL: LoRA installed on 0 processors! "
-                    "Versione Diffusers incompatibile."
+                    "Diffusers version incompatible."
                 )
                 self.lora_layers = None
 
@@ -237,7 +237,7 @@ class MusicTokenWrapper(nn.Module):
                 self.unet.enable_xformers_memory_efficient_attention()
                 logger.info("xformers memory efficient attention: ON")
             except Exception as e:
-                logger.info(f"xformers non disponibile ({e}). Fallback a PyTorch 2.0 SDPA.")
+                logger.info(f"xformers not available ({e}). Fallback to PyTorch 2.0 SDPA.")
                 try:
                     from diffusers.models.attention_processor import AttnProcessor2_0
                     self.unet.set_attn_processor(AttnProcessor2_0())
@@ -258,7 +258,7 @@ class MusicTokenWrapper(nn.Module):
             if hasattr(args, 'lora') and args.lora and self.lora_layers is not None:
                 self.lora_layers.requires_grad_(True)
                 self.lora_layers.train()
-                logger.info("lora_layers.train() — UNet backbone rimane frozen/eval.")
+                logger.info("lora_layers.train() — UNet backbone remains frozen/eval.")
 
         elif args.data_set == 'test':
             map_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -284,7 +284,7 @@ class MusicTokenWrapper(nn.Module):
                 self.unet.load_state_dict(_load_weights(args.learned_unet, map_device))
             if hasattr(args, 'lora') and args.lora:
                 if self.lora_layers is None:
-                    raise RuntimeError("lora_layers is None ma --lora=True.")
+                    raise RuntimeError("lora_layers is None but --lora=True.")
                 _lora_state = _load_weights(args.learned_embeds_lora, map_device)
                 self.lora_layers.load_state_dict(_lora_state)
                 self.lora_layers.eval()
@@ -292,7 +292,7 @@ class MusicTokenWrapper(nn.Module):
 
     # ──────────────────────────────────────────────────────────────────────────
     def set_placeholder_token_id(self, token_id: int):
-        """No-op mantenuto per compatibilità CLI."""
+        """No-op kept for CLI compatibility."""
         pass
 
     # ──────────────────────────────────────────────────────────────────────────

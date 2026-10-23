@@ -2,12 +2,12 @@
 """
 test_ca.py — Inference script for Musipainter (Audio-Guided Cross-Attention branch).
 
-NOTE: rinominato da test_no_accel_colab.py per convivere con la variante
-Early-Fusion (test_ef.py) nello stesso repository, selezionabile tramite
+NOTE: Renamed from test_no_accel_colab.py to coexist with the variant
+Early-Fusion (test_ef.py) in the same repository, selectable via
 musipainter_test.py --architecture Musipainter-CA.
-Unica modifica rispetto all'originale: l'import di MusicTokenWrapper punta
-al modulo rinominato modules.MusicToken.MusicToken_no_accel_ca.
-Nessun'altra logica è stata alterata.
+Only change from the original: the import of MusicTokenWrapper points
+to the renamed module modules.MusicToken.MusicToken_no_accel_ca.
+No other logic has been altered.
 """
 
 import argparse
@@ -256,7 +256,7 @@ def inference(args):
                  if _n_gpus > 0 else "CPU")
 
     logger.info("=" * 60)
-    logger.info("START: INFERENCE [FIXED] — Musipainter")
+    logger.info("START: INFERENCE [FIXED] - Musipainter")
     logger.info(f"timestamp             : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"GPU                   : {_n_gpus}  ({_gpu_info})")
     logger.info(f"base_model            : {args.pretrained_model_name_or_path}")

@@ -1,13 +1,13 @@
 # @title test_ef.py
 """
-test_ef.py — Inference script per Musipainter (Branch FuseLIP / Early Fusion).
+test_ef.py — Inference script for Musipainter (Branch FuseLIP / Early Fusion).
 
-NOTE: rinominato da test_no_accel_colab.py per convivere con la variante
-Cross-Attention (test_ca.py) nello stesso repository, selezionabile tramite
+NOTE: Renamed from test_no_accel_colab.py to coexist with the variant
+Cross-Attention (test_ca.py) in the same repository, selectable via
 musipainter_test.py --architecture Musipainter-EF.
-Unica modifica rispetto all'originale: l'import di MusicTokenWrapper punta
-al modulo rinominato modules.MusicToken.MusicToken_no_accel_ef.
-Nessun'altra logica è stata alterata.
+Only change from the original: the import of MusicTokenWrapper points
+to the renamed module modules.MusicToken.MusicToken_no_accel_ef.
+No other logic has been altered.
 """
 
 import argparse
@@ -49,7 +49,7 @@ def parse_args():
             return True
         if v.lower() in ('no', 'false', '0'):
             return False
-        raise argparse.ArgumentTypeError(f"Valore booleano atteso, ricevuto: '{v}'")
+        raise argparse.ArgumentTypeError(f"Boolean value expected, received: '{v}'")
 
     parser = argparse.ArgumentParser(description="Inference script — Musipainter FuseLIP branch")
 
@@ -93,7 +93,7 @@ def parse_args():
     parser.add_argument("--center_crop",         action="store_true", default=False)
     parser.add_argument("--hf_cache_dir",        type=str, default="/tmp/hf_model_cache")
 
-    # Early Fusion hyper-parameters (devono corrispondere alla configurazione di training)
+    # Early Fusion hyper-parameters (must match training configuration)
     parser.add_argument("--ef_d_model",          type=int,   default=512)
     parser.add_argument("--ef_nhead",            type=int,   default=8)
     parser.add_argument("--ef_num_layers",       type=int,   default=4)
@@ -104,9 +104,9 @@ def parse_args():
         "--uncond_mode", type=str, default="zeros",
         choices=["zeros", "text_only"],
         help=(
-            "'zeros' (default): uncond = audio silenzioso + testo vuoto → p(x). "
-            "Corrisponde al ~3%% CFG dropout full-zero usato in training. "
-            "'text_only': uncond = audio silenzioso + prompt testuale → p(x|text). "
+            "'zeros' (default): uncond = silent audio + empty text -> p(x). "
+            "Corresponds to ~3% CFG dropout full-zero used during training. "
+            "'text_only': uncond = silent audio + text prompt -> p(x|text). "
         ),
     )
 
@@ -117,7 +117,7 @@ def parse_args():
         args.local_rank = env_local_rank
 
     if args.data_dir is None:
-        raise ValueError("Specificare --data_dir.")
+        raise ValueError("Specify --data_dir.")
 
     args.image_latents_dir = args.latents_dir
     return args
@@ -129,7 +129,7 @@ def parse_args():
 
 def _resolve_checkpoint_path(explicit_path, output_dir, stem, label):
     """
-    Risolve il miglior checkpoint disponibile, con fallback .bin → .safetensors.
+    Resolve the best available checkpoint, with fallback .bin -> .safetensors.
     """
     import glob
 
@@ -158,8 +158,8 @@ def _resolve_checkpoint_path(explicit_path, output_dir, stem, label):
             return hits[0]
 
     raise FileNotFoundError(
-        f"[AUTO-CHECKPOINT] Nessun checkpoint trovato per '{label}'. "
-        f"Cercato: {explicit_path} e pattern glob in {output_dir}."
+        f"[AUTO-CHECKPOINT] No checkpoint found for '{label}'. "
+        f"Searched: {explicit_path} and glob patterns in {output_dir}."
     )
 
 
@@ -172,9 +172,9 @@ def _probe_audio_frame_count(dataset) -> int:
     first_batch  = next(iter(probe_loader))
     t_a = first_batch["audio_features"].shape[1]
     logger.info(
-        f"[CFG] T_a probed={t_a} dal primo sample "
+        f"[CFG] T_a probed={t_a} from first sample "
         f"(shape={list(first_batch['audio_features'].shape)}). "
-        f"Il silent audio tensor per CFG avrà shape [1,{t_a},2304]."
+        f"The silent audio tensor for CFG will have shape [1,{t_a},2304]."
     )
     return t_a
 
@@ -247,7 +247,7 @@ def _build_uncond_embedding(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def inference(args):
-    """Loop di inferenza Early Fusion e salvataggio immagini generate."""
+    """Early Fusion inference loop and saving generated images."""
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "imgs"), exist_ok=True)
@@ -272,14 +272,14 @@ def inference(args):
 
     _n_q = getattr(args, 'ef_n_audio_queries', 1)
     _seq_desc = (
-        f"T_a + 1 + 77 (Full Temporal — FuseLIP puro)"
+        f"T_a + 1 + 77 (Full Temporal - FuseLIP pure)"
         if _n_q == 0 else
         f"{_n_q} + 1 + 77 (Resampler)" if _n_q > 1 else
         f"1 + 1 + 77 (AttentivePooling)"
     )
 
     logger.info("=" * 60)
-    logger.info("START: INFERENCE — FuseLIP / Early Fusion branch")
+    logger.info("START: INFERENCE - FuseLIP / Early Fusion branch")
     logger.info(f"timestamp           : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"GPU                 : {_n_gpus}  ({_gpu_info})")
     logger.info(f"base_model          : {args.pretrained_model_name_or_path}")
@@ -364,7 +364,7 @@ def inference(args):
     # ── Dynamic T_a probe ─────────────────────────────────────────────────────
     t_a: int = _probe_audio_frame_count(test_dataset)
 
-    # ── Unconditional embedding per CFG (costruito una volta sola) ────────────
+    # ── Unconditional embedding for CFG (built once only) ────────────
     uncond_embeddings = _build_uncond_embedding(
         args=args,
         base_model=base_model,
@@ -374,7 +374,7 @@ def inference(args):
         device=device,
     )
 
-    # ── Tokenizza il prompt condizionale (costante per tutti i sample) ────────
+    # ── Tokenize the conditional prompt (constant for all samples) ────────
     cond_input_ids = tokenizer(
         [args.prompt],
         padding="max_length",
@@ -383,7 +383,7 @@ def inference(args):
         return_tensors="pt",
     ).input_ids.to(device)
 
-    # ── DataLoader per il loop di generazione ─────────────────────────────────
+    # ── DataLoader for the generation loop ─────────────────────────────────
     dataloader_generator = torch.Generator(device="cpu")
     if args.seed is not None:
         dataloader_generator.manual_seed(args.seed)
@@ -409,10 +409,10 @@ def inference(args):
         aud_features = batch["audio_features"].to(dtype=torch.float32)
 
         assert aud_features.shape[1] == t_a, (
-            f"[CFG] Audio frame count mismatch al step {step}: "
-            f"atteso T_a={t_a} (probed dal dataset) ma ricevuto "
+            f"[CFG] Audio frame count mismatch at step {step}: "
+            f"expected T_a={t_a} (probed from dataset) but received "
             f"T_a={aud_features.shape[1]}. "
-            "Verifica che tutti gli embeddings siano stati preprocessati con lo stesso stride."
+            "Verify that all embeddings have been preprocessed with the same stride."
         )
 
         with torch.no_grad():
@@ -470,7 +470,7 @@ def inference(args):
             f'{batch["aud_id"][0]}_{batch["image_id"][0]}_{batch["label"][0]}.jpg'
         )
         image.save(os.path.join(args.output_dir, "imgs", args.run_name, save_name))
-        logger.info(f"Salvato: {save_name} ({step + 1}/{args.generation_steps})")
+        logger.info(f"Saved: {save_name} ({step + 1}/{args.generation_steps})")
 
     _total = time.time() - _t_start
     n_gen  = min(step + 1, args.generation_steps)

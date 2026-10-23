@@ -2,12 +2,12 @@
 """
 train_ca.py — DDP Training & Validation for Musipainter (Audio-Guided Cross-Attention branch).
 
-NOTE: rinominato da train_validation_no_accel_colab.py per convivere con la
-variante Early-Fusion (train_ef.py) nello stesso repository, selezionabile
-tramite musipainter_train.py --architecture Musipainter-CA.
-Unica modifica rispetto all'originale: l'import di MusicTokenWrapper punta
-al modulo rinominato modules.MusicToken.MusicToken_no_accel_ca.
-Nessun'altra logica è stata alterata.
+NOTE: Renamed from train_validation_no_accel_colab.py to coexist with the
+Early-Fusion variant (train_ef.py) in the same repository, selectable
+via musipainter_train.py --architecture Musipainter-CA.
+Only change from the original: the import of MusicTokenWrapper points
+to the renamed module modules.MusicToken.MusicToken_no_accel_ca.
+No other logic has been altered.
 """
 
 import argparse

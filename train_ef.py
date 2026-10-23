@@ -1,13 +1,13 @@
 # @title train_ef.py
 """
-train_ef.py — DDP Training & Validation per Musipainter (Branch FuseLIP / Early Fusion).
+train_ef.py — DDP Training & Validation for Musipainter (Branch FuseLIP / Early Fusion).
 
-NOTE: rinominato da train_validation_no_accel_colab.py per convivere con la
-variante Cross-Attention (train_ca.py) nello stesso repository, selezionabile
-tramite musipainter_train.py --architecture Musipainter-EF.
-Unica modifica rispetto all'originale: l'import di MusicTokenWrapper punta
-al modulo rinominato modules.MusicToken.MusicToken_no_accel_ef.
-Nessun'altra logica è stata alterata.
+NOTE: Renamed from train_validation_no_accel_colab.py to coexist with the
+Cross-Attention variant (train_ca.py) in the same repository, selectable
+via musipainter_train.py --architecture Musipainter-EF.
+Only change from the original: the import of MusicTokenWrapper points
+to the renamed module modules.MusicToken.MusicToken_no_accel_ef.
+No other logic has been altered.
 """
 
 import argparse
@@ -180,15 +180,15 @@ def load_checkpoint(resume_path, embedder, optimizer, scaler, lr_scheduler,
     best_vloss      = ckpt.get("best_vloss", float('inf'))
     best_model_path = ckpt.get("best_model_path", None)
     if best_model_path is not None and not os.path.exists(best_model_path):
-        logger.warning(f"[RESUME] best_model_path non trovato su disco: {best_model_path}.")
+        logger.warning(f"[RESUME] best_model_path not found on disk: {best_model_path}.")
         best_model_path = None
     _arch = ckpt.get("arch", "early_fusion_v9")
     if _arch != "early_fusion_v9":
         logger.warning(
-            f"[RESUME] Checkpoint arch='{_arch}' — addestrato con architettura diversa. "
-            "I pesi potrebbero non essere compatibili con EarlyFusionEncoder."
+            f"[RESUME] Checkpoint arch='{_arch}' - trained with different architecture. "
+            "Weights may not be compatible with EarlyFusionEncoder."
         )
-    logger.info(f"[RESUME] Ripresa da step={global_step}, best_vloss={best_vloss:.4f}.")
+    logger.info(f"[RESUME] Resuming from step={global_step}, best_vloss={best_vloss:.4f}.")
     return global_step, best_vloss, best_model_path
 
 
@@ -197,10 +197,10 @@ def load_embedder_weights(weight_path, embedder, device, resume_step: int = 0):
     if not os.path.exists(resolved) and resolved.endswith(".bin"):
         sf_candidate = resolved[:-4] + ".safetensors"
         if os.path.exists(sf_candidate):
-            logger.info(f"[RESUME-WEIGHTS] .bin non trovato, usando .safetensors: {sf_candidate}")
+            logger.info(f"[RESUME-WEIGHTS] .bin not found, using .safetensors: {sf_candidate}")
             resolved = sf_candidate
     if not os.path.exists(resolved):
-        raise FileNotFoundError(f"[RESUME-WEIGHTS] File pesi non trovato: {resolved}")
+        raise FileNotFoundError(f"[RESUME-WEIGHTS] Weight file not found: {resolved}")
     logger.info(f"[RESUME-WEIGHTS] Loading embedder weights from: {resolved}")
     if resolved.endswith(".safetensors"):
         from modules.preprocess.utils import load_safetensors
@@ -212,7 +212,7 @@ def load_embedder_weights(weight_path, embedder, device, resume_step: int = 0):
         logger.warning(f"[RESUME-WEIGHTS] Missing keys: {missing}")
     if unexpected:
         logger.warning(f"[RESUME-WEIGHTS] Unexpected keys: {unexpected}")
-    logger.info(f"[RESUME-WEIGHTS] EarlyFusionEncoder caricato (resume_step={resume_step})")
+    logger.info(f"[RESUME-WEIGHTS] EarlyFusionEncoder loaded (resume_step={resume_step})")
     return resume_step, float('inf')
 
 
@@ -222,10 +222,10 @@ def load_embedder_weights(weight_path, embedder, device, resume_step: int = 0):
 
 def build_label_embedding_cache(tokenizer, token_embedding, all_labels, device):
     """
-    Pre-calcola i vettori target per la cosine loss per ogni label unico.
+    Pre-calculate target vectors for cosine loss for each unique label.
 
-    Media degli embedding CLIP per le parole del label (esclusi BOS/EOS),
-    poi normalizzata L2 per produrre l̂ come da Musipainter eq. (2/5).
+    Mean of CLIP embeddings for label words (excluding BOS/EOS),
+    then L2 normalized to produce l-hat as per Musipainter eq. (2/5).
     """
     label_list = sorted(set(all_labels))
     vecs = []
@@ -275,7 +275,7 @@ def precompute_vae_latents(vae, dataloader, device, use_amp):
         sample = next(iter(cache.values()))
         size_mb = sample.numel() * sample.element_size() * n / (1024 ** 2)
         logger.info(
-            f"VAE latent cache: {n} immagini, shape={list(sample.shape)}, "
+            f"VAE latent cache: {n} images, shape={list(sample.shape)}, "
             f"~{size_mb:.0f} MB (float16)"
         )
     return cache
@@ -303,8 +303,8 @@ def _check_tb_size(writer, tb_dir: str, max_mb: int):
     size_mb = _dir_size_mb(tb_dir)
     if size_mb > max_mb:
         logger.warning(
-            f"TensorBoard runs/ usa {size_mb:.0f} MB > {max_mb} MB. "
-            "Pulizia e riapertura writer."
+            f"TensorBoard runs/ uses {size_mb:.0f} MB > {max_mb} MB. "
+            "Cleaning and reopening writer."
         )
         writer.close()
         import shutil
@@ -324,7 +324,7 @@ def _rotate_checkpoints(ckpt_paths: list, keep_n: int):
         old = ckpt_paths.pop(0)
         if os.path.exists(old):
             os.remove(old)
-            logger.info(f"[RESUME] Vecchio checkpoint rimosso: {old}")
+            logger.info(f"[RESUME] Old checkpoint removed: {old}")
 
 
 def _check_disk_space(output_dir: str, warn_gb: float = 1.0, critical_gb: float = 0.3):
@@ -337,20 +337,20 @@ def _check_disk_space(output_dir: str, warn_gb: float = 1.0, critical_gb: float 
         working_dir_mb = _dir_size_mb(output_dir)
         if free_gb < critical_gb:
             logger.error(
-                f"[DISK-CRITICAL] {free_gb:.2f} GB liberi / {total_gb:.1f} GB totali. "
-                f"Output dir: {working_dir_mb:.0f} MB. RISCHIO CRASH."
+                f"[DISK-CRITICAL] {free_gb:.2f} GB free / {total_gb:.1f} GB total. "
+                f"Output dir: {working_dir_mb:.0f} MB. RISK OF CRASH."
             )
         elif free_gb < warn_gb:
             logger.warning(
-                f"[DISK-WARN] {free_gb:.2f} GB liberi ({used_gb:.1f}/{total_gb:.1f} GB)."
+                f"[DISK-WARN] {free_gb:.2f} GB free ({used_gb:.1f}/{total_gb:.1f} GB)."
             )
         else:
             logger.info(
-                f"[DISK-OK] {free_gb:.2f} GB liberi. Output dir: {working_dir_mb:.0f} MB."
+                f"[DISK-OK] {free_gb:.2f} GB free. Output dir: {working_dir_mb:.0f} MB."
             )
         return free_gb
     except Exception as e:
-        logger.warning(f"[DISK-MONITOR] Impossibile leggere spazio disco: {e}")
+        logger.warning(f"[DISK-MONITOR] Unable to read disk space: {e}")
         return None
 
 
@@ -443,7 +443,7 @@ def parse_args():
         args.local_rank = env_local_rank
 
     if args.data_dir is None:
-        raise ValueError("Specificare --data_dir.")
+        raise ValueError("Specify --data_dir.")
 
     args.image_latents_dir = args.latents_dir
     return args
@@ -502,8 +502,8 @@ def train_validation():
         )
 
     logger.info(
-        "Tokenizer caricato — FuseLIP / Early Fusion mode: "
-        "no <*> injection nel CLIP text encoder."
+        "Tokenizer loaded - FuseLIP / Early Fusion mode: "
+        "no <*> injection in CLIP text encoder."
     )
 
     noise_scheduler = DDPMScheduler.from_pretrained(
@@ -591,7 +591,7 @@ def train_validation():
             train_latent_cache = None
             valid_latent_cache = None
             if is_main:
-                logger.info("[PREIMG] latents_dir fornita → LazyLatentIndex attivo.")
+                logger.info("[PREIMG] latents_dir provided -> LazyLatentIndex active.")
         else:
             if is_main:
                 precompute_train_loader = torch.utils.data.DataLoader(
@@ -623,10 +623,10 @@ def train_validation():
         try:
             base_model.unet.enable_gradient_checkpointing()
             if is_main:
-                logger.info("UNet gradient checkpointing abilitato da flag CLI")
+                logger.info("UNet gradient checkpointing enabled by CLI flag")
         except Exception as e:
             if is_main:
-                logger.warning(f"Gradient checkpointing non disponibile: {e}")
+                logger.warning(f"Gradient checkpointing not available: {e}")
 
     model = model.to(device)
 
@@ -637,7 +637,7 @@ def train_validation():
         )
         base_model.embedder = base_model.early_fusion
         if is_main:
-            logger.info("EarlyFusionEncoder compiled con torch.compile.")
+            logger.info("EarlyFusionEncoder compiled with torch.compile.")
     except Exception as e:
         if is_main:
             logger.info(f"torch.compile skipped: {e}")
@@ -757,8 +757,8 @@ def train_validation():
     if args.use_precompute_vae_latents and n_workers_loop != args.dataloader_num_workers:
         if is_main:
             logger.info(
-                f"Ricreazione train_dataloader: "
-                f"num_workers {args.dataloader_num_workers} → {n_workers_loop}"
+                f"Recreating train_dataloader: "
+                f"num_workers {args.dataloader_num_workers} -> {n_workers_loop}"
             )
         del train_dataloader
         train_dataloader = torch.utils.data.DataLoader(
@@ -794,7 +794,7 @@ def train_validation():
 
     if is_main:
         logger.info("=" * 60)
-        logger.info("START: TRAIN & VALIDATION — FuseLIP / Early Fusion")
+        logger.info("START: TRAIN & VALIDATION - FuseLIP / Early Fusion")
         logger.info(f"timestamp           : {time.strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"base_model          : {args.pretrained_model_name_or_path}")
         logger.info(f"train samples       : {len(train_dataset)}")
@@ -1023,7 +1023,7 @@ def train_validation():
                         _eta_h = int(args.max_train_steps * _sps // 3600)
                         _eta_m = int((args.max_train_steps * _sps % 3600) // 60)
                         logger.info(
-                            f"[PERF] Velocità reale (steps 10-40): {_sps:.2f}s/step  "
+                            f"[PERF] Actual speed (steps 10-40): {_sps:.2f}s/step  "
                             f"ETA: ~{_eta_h}h {_eta_m:02d}m"
                         )
 
@@ -1115,7 +1115,7 @@ def train_validation():
                             os.replace(_nl_tmp, _nl)
                         best_model_path = _nb
                         logger.info(
-                            f"Nuovo best (mid-epoch step={global_step}): "
+                            f"New best (mid-epoch step={global_step}): "
                             f"vloss={best_vloss:.4f}"
                         )
                     model.train()
@@ -1183,7 +1183,7 @@ def train_validation():
                         os.replace(_nl_tmp, _nl)
                     best_model_path = _nb
                     logger.info(
-                        f"  Nuovo best early_fusion: {_nb} (vloss={best_vloss:.4f})"
+                        f"  New best early_fusion: {_nb} (vloss={best_vloss:.4f})"
                     )
                 model.train()
                 base_model.unet.eval()
@@ -1213,7 +1213,7 @@ def train_validation():
                 os.path.join(args.output_dir, "learned_embeds_lora_layers.safetensors")
             )
         logger.info("=" * 60)
-        logger.info("TRAINING COMPLETATO CON SUCCESSO")
+        logger.info("TRAINING COMPLETED SUCCESSFULLY")
         logger.info(f"total steps         : {global_step}/{args.max_train_steps}")
         logger.info(f"best validation loss: {best_vloss:.4f}")
         logger.info(f"best model          : {best_model_path or 'N/A'}")
